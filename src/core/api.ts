@@ -61,3 +61,10 @@ export async function subscribeCore(
   const unlistenLog = await listen<CoreLogEvent>("core-log", (event) => onLog(event.payload));
   return () => { unlistenStatus(); unlistenLog(); };
 }
+
+export type TrayAction = "toggle-connection" | "open-diagnostics";
+
+export async function subscribeTrayActions(onAction: (action: TrayAction) => void): Promise<UnlistenFn> {
+  requireDesktop();
+  return listen<TrayAction>("tray-action", (event) => onAction(event.payload));
+}

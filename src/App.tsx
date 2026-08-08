@@ -10,7 +10,7 @@ import { Button } from "./components/ui/button";
 import { Switch } from "./components/ui/switch";
 import {
   getCoreLogs, getCoreStatus, isDesktopRuntime, loadProfile, probeCore, runtimeInfo,
-  saveProfile as persistProfile, startCore, stopCore, subscribeCore,
+  saveProfile as persistProfile, startCore, stopCore, subscribeCore, subscribeTrayActions,
 } from "./core/api";
 import { buildCoreCommand } from "./core/command";
 import {
@@ -36,6 +36,11 @@ const phaseCopy: Record<ConnectionPhase, { label: string; detail: string }> = {
 };
 
 const activeStates = new Set(["starting", "scanning", "connecting", "connected", "reconnecting"]);
+const appVersion = import.meta.env.VITE_APP_VERSION || "1.0.0";
+const appVersionLabel = appVersion.replace(
+  /^(\d+\.\d+\.\d+)-.*\.(\d+)\+([0-9a-z]+)$/,
+  "v$1 · b$2 · $3",
+).replace(/^(\d+\.\d+\.\d+)$/, "v$1");
 
 function App() {
   const [view, setView] = useState<ViewId>("overview");
@@ -95,6 +100,24 @@ function App() {
     return () => window.removeEventListener("keydown", handleShortcut);
   });
 
+  useEffect(() => {
+    if (!desktop) return;
+    let disposed = false;
+    let unsubscribe: (() => void) | undefined;
+    void subscribeTrayActions((action) => {
+      if (disposed) return;
+      if (action === "open-diagnostics") {
+        setView("diagnostics");
+        return;
+      }
+      void toggleConnection();
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unsubscribe = cleanup;
+    }).catch(showError);
+    return () => { disposed = true; unsubscribe?.(); };
+  }, [desktop, profile, running]);
+
   function showError(error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     setToast({ title: "Action failed", message, error: true });
@@ -152,7 +175,7 @@ function App() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><div className="brand-mark"><span /><span /></div><div><strong>WhiteAesther</strong><small>DESKTOP LAB</small></div></div>
+        <div className="brand"><img className="brand-mark" src="/whiteaesther-logo.png" alt="" /><div><strong>WhiteAesther</strong><small title={`WhiteAesther ${appVersion}`}>{appVersionLabel}</small></div></div>
         <nav className="navigation" aria-label="Main navigation">
           {navigation.map(({ id, label, icon: Icon, group }) => <div key={id}>{group && <p className="nav-label">{group}</p>}<button className={`nav-item ${view === id ? "active" : ""}`} onClick={() => setView(id)}><Icon /><span>{label}</span>{id === "diagnostics" && <i className={`nav-dot ${snapshot.lastError ? "error" : ""}`} />}</button></div>)}
         </nav>
