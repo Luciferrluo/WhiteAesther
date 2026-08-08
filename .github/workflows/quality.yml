@@ -27,5 +27,5 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --manifest-path src-tauri/Cargo.toml --locked
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
