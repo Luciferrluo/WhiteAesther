@@ -124,6 +124,17 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Flatten package directories
+        shell: bash
+        run: |
+          mkdir flattened-assets
+          while IFS= read -r -d '' package; do
+            cp -- "$package" "flattened-assets/$(basename "$package")"
+          done < <(find release-assets -type f -print0)
+          rm -rf release-assets
+          mv flattened-assets release-assets
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 6
+
       - name: Create installer pack and SHA-256 checksums
         shell: bash
         run: |
