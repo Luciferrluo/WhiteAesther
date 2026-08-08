@@ -1,0 +1,180 @@
+name: build, test and release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: whiteaesther-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AETHER_REVISION: 21b9872d080bd185600b93ff20b87f3f3e1e7307
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows x64
+            artifact: windows-x64
+            core: aether.exe
+            bundles: nsis,msi
+            packages: |
+              src-tauri/target/release/bundle/nsis/*.exe
+              src-tauri/target/release/bundle/msi/*.msi
+          - os: macos-latest
+            name: macOS
+            artifact: macos
+            core: aether
+            bundles: dmg
+            packages: src-tauri/target/release/bundle/dmg/*.dmg
+          - os: ubuntu-22.04
+            name: Linux x64
+            artifact: linux-x64
+            core: aether
+            bundles: deb,rpm,appimage
+            packages: |
+              src-tauri/target/release/bundle/deb/*.deb
+              src-tauri/target/release/bundle/rpm/*.rpm
+              src-tauri/target/release/bundle/appimage/*.AppImage
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out WhiteAesther
+        uses: actions/checkout@v4
+
+      - name: Check out the pinned Aether core
+        uses: actions/checkout@v4
+        with:
+          repository: MatinSenPai/Aether
+          ref: ${{ env.AETHER_REVISION }}
+          path: aether-core
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev
+          libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+          cmake ninja-build perl pkg-config clang rpm
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Compile and test the frontend
+        run: pnpm build
+
+      - name: Compile the Aether core
+        run: cargo build --release --locked --manifest-path aether-core/aether/Cargo.toml
+
+      - name: Stage the target-specific Aether sidecar
+        run: pnpm stage:core -- --source "${{ github.workspace }}/aether-core/aether/target/release/${{ matrix.core }}"
+
+      - name: Test the Tauri backend
+        run: cargo test --release --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Build the desktop package
+        run: pnpm tauri build --bundles "${{ matrix.bundles }}"
+
+      - name: Upload desktop packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: whiteaesther-${{ matrix.artifact }}
+          path: ${{ matrix.packages }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    needs: package
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download desktop packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create installer pack and SHA-256 checksums
+        shell: bash
+        run: |
+          cd release-assets
+          zip -9 WhiteAesther-installers.zip \
+            ./*.exe ./*.msi ./*.dmg ./*.deb ./*.rpm ./*.AppImage
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+
+      - name: Publish tagged or continuous release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF_NAME}"
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release upload "$tag" release-assets/* --clobber
+            else
+              gh release create "$tag" release-assets/* \
+                --verify-tag \
+                --generate-notes \
+                --title "WhiteAesther $tag"
+            fi
+            exit 0
+          fi
+
+          tag="continuous"
+          title="WhiteAesther continuous build"
+          notes="Automated packages from commit ${GITHUB_SHA}. This prerelease is replaced after every successful main build."
+
+          if gh api "repos/${GH_REPO}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GH_REPO}/git/refs/tags/${tag}" \
+              -f sha="${GITHUB_SHA}" \
+              -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GH_REPO}/git/refs" \
+              -f ref="refs/tags/${tag}" \
+              -f sha="${GITHUB_SHA}" >/dev/null
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "$title" --notes "$notes" --prerelease
+            gh release upload "$tag" release-assets/* --clobber
+          else
+            gh release create "$tag" release-assets/* \
+              --title "$title" \
+              --notes "$notes" \
+              --prerelease
+          fi
