@@ -52,6 +52,12 @@ export async function saveProfile(profile: ConnectionProfile): Promise<Connectio
   return invoke("save_profile", { profile });
 }
 
+/** Writes an already-composed, already-reviewed report and returns its path. */
+export async function saveReport(contents: string, filename: string): Promise<string> {
+  requireDesktop();
+  return invoke("save_report", { contents, filename });
+}
+
 export async function subscribeCore(
   onStatus: (status: CoreSnapshot) => void,
   onLog: (log: CoreLogEvent) => void,
@@ -67,4 +73,35 @@ export type TrayAction = "toggle-connection" | "open-diagnostics";
 export async function subscribeTrayActions(onAction: (action: TrayAction) => void): Promise<UnlistenFn> {
   requireDesktop();
   return listen<TrayAction>("tray-action", (event) => onAction(event.payload));
+}
+
+export interface ScanCandidate {
+  peer: string;
+  rttMs: number;
+}
+
+export interface ScanOutcome {
+  candidates: ScanCandidate[];
+  /** Which transport produced these, which is not always the one configured. */
+  transport: string;
+  /** True when the configured transport found nothing and the other was swept. */
+  fellBack: boolean;
+}
+
+/** Ranks reachable gateways without connecting. Rejects while a tunnel is up. */
+export async function scanEndpoints(profile: ConnectionProfile, limit = 8): Promise<ScanOutcome> {
+  requireDesktop();
+  return invoke("scan_endpoints", { profile, limit });
+}
+
+/** Validates one address with a real authenticated handshake. */
+export async function testEndpoint(profile: ConnectionProfile, endpoint: string): Promise<ScanCandidate> {
+  requireDesktop();
+  return invoke("test_endpoint", { profile, endpoint });
+}
+
+/** Kills an in-flight scan. Returns false when there was nothing to stop. */
+export async function cancelScan(): Promise<boolean> {
+  requireDesktop();
+  return invoke("cancel_scan");
 }

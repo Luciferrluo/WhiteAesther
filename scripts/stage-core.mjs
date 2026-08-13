@@ -40,6 +40,9 @@ async function findCore(binaryExtension) {
   const requested = option("--source") ?? process.env.AETHER_CORE_SOURCE ?? process.env.WHITEAESTHER_CORE_PATH;
   const candidates = [
     requested,
+    // The fork first: it is the one with the scanner's reporting modes.
+    join(appRoot, "..", "Aether-whiteaesther", "aether", "target", "release", `aether${binaryExtension}`),
+    join(appRoot, "..", "Aether-whiteaesther", "aether", "target", "debug", `aether${binaryExtension}`),
     join(appRoot, "..", "Aether", "aether", "target", "release", `aether${binaryExtension}`),
     join(appRoot, "..", "Aether", "aether", "target", "debug", `aether${binaryExtension}`),
   ].filter(Boolean);

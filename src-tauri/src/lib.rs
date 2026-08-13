@@ -1,4 +1,6 @@
 mod core_supervisor;
+mod scanner;
+mod system_proxy;
 
 use core_supervisor::CoreSupervisor;
 use tauri::{
@@ -31,6 +33,15 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(CoreSupervisor::new())
         .setup(|app| {
+            // A previous run that was killed rather than closed may have left
+            // the system proxy pointing at a listener that is now gone, which
+            // takes the machine off the network until it is put back.
+            match system_proxy::recover(app.handle()) {
+                Ok(true) => eprintln!("restored the system proxy left by an earlier run"),
+                Ok(false) => {}
+                Err(error) => eprintln!("could not restore the system proxy: {error}"),
+            }
+
             let open = MenuItem::with_id(app, "open", "Open WhiteAesther", true, None::<&str>)?;
             let connection = MenuItem::with_id(
                 app,
@@ -73,7 +84,7 @@ pub fn run() {
                         let _ = app.emit("tray-action", "open-diagnostics");
                     }
                     "quit" => {
-                        app.state::<CoreSupervisor>().shutdown();
+                        app.state::<CoreSupervisor>().shutdown(app);
                         app.exit(0);
                     }
                     _ => {}
@@ -100,7 +111,8 @@ pub fn run() {
                 let _ = window.hide();
             }
             tauri::WindowEvent::Destroyed => {
-                window.state::<CoreSupervisor>().shutdown();
+                let app = window.app_handle();
+                app.state::<CoreSupervisor>().shutdown(app);
             }
             _ => {}
         })
@@ -113,6 +125,10 @@ pub fn run() {
             core_supervisor::core_logs,
             core_supervisor::save_profile,
             core_supervisor::load_profile,
+            core_supervisor::save_report,
+            scanner::scan_endpoints,
+            scanner::test_endpoint,
+            scanner::cancel_scan,
         ])
         .build(tauri::generate_context!())
         .expect("error while running WhiteAesther")
@@ -122,7 +138,7 @@ pub fn run() {
         // ponytail: cannot cover SIGKILL/OOM — that needs a pid file reaped at next launch.
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
-                app.state::<CoreSupervisor>().shutdown();
+                app.state::<CoreSupervisor>().shutdown(app);
             }
         });
 }

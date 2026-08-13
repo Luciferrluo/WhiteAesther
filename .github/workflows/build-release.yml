@@ -15,7 +15,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  AETHER_REVISION: 21b9872d080bd185600b93ff20b87f3f3e1e7307
+  # The fork adds the reporting modes the endpoint scanner needs. Pinned to a
+  # tag rather than a branch so a release is reproducible.
+  AETHER_REVISION: v1.5.0-whiteaesther.2
 
 jobs:
   package:
@@ -56,7 +58,7 @@ jobs:
       - name: Check out the pinned Aether core
         uses: actions/checkout@v7
         with:
-          repository: MatinSenPai/Aether
+          repository: WhiteDNS/Aether
           ref: ${{ env.AETHER_REVISION }}
           path: aether-core
 
@@ -76,7 +78,10 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 22
+          # 24 for the test runner: the unit tests are TypeScript, and Node only
+          # strips types without a flag from 22.18 onward. Pinning the major
+          # keeps that from depending on which 22.x the runner happens to have.
+          node-version: 24
           cache: pnpm
 
       - name: Install Rust
@@ -102,8 +107,11 @@ jobs:
           echo "VITE_APP_VERSION=${visible_version}" >> "$GITHUB_ENV"
           echo "WhiteAesther UI version: ${visible_version}"
 
-      - name: Compile and test the frontend
+      - name: Compile the frontend
         run: pnpm build
+
+      - name: Test the frontend
+        run: pnpm test
 
       - name: Compile the Aether core
         run: cargo build --release --locked --manifest-path aether-core/aether/Cargo.toml
