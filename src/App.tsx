@@ -321,8 +321,8 @@ function Preferences({ profile, onChange, probe, onProbe, runtime }: ProfileProp
   // The selector below is a reference view of all three platforms; the proxy
   // toggle is not, so it describes the machine this is actually running on.
   const host = hostPlatform(runtime);
-  const [platform,setPlatform]=useState(host);
-  return <><PageIntro badge="DESKTOP SHELL" title="Preferences" copy="Cross-platform behavior and the managed core executable." action={<Button variant="secondary" onClick={onProbe}><RefreshCw/>Check core</Button>} /><div className="platforms">{["Windows","macOS","Linux"].map(name=><button className={platform===name?"active":""} onClick={()=>setPlatform(name)} key={name}>{name}</button>)}</div><div className="two-col"><article className="card"><div className="section-head"><div><span className="label">AETHER CORE</span><h3>{probe.available?probe.version:"Not detected"}</h3></div><span className={`availability ${probe.available?"online":"offline"}`}>{probe.available?"READY":"MISSING"}</span></div><TextField label="Core executable" value={profile.corePath??""} placeholder="Auto-detect or absolute path" onChange={(value)=>onChange({...profile,corePath:value||null})}/><p className="field-help">{probe.path??probe.message}</p></article><article className="card"><div className="section-head"><div><span className="label">{platform.toUpperCase()}</span><h3>System integration</h3></div></div>
+  const [platform,setPlatform]=useState(host ?? "Windows");
+  return <><PageIntro badge="DESKTOP SHELL" title="Preferences" copy="Cross-platform behavior and the managed core executable." action={<Button variant="secondary" onClick={onProbe}><RefreshCw/>Check core</Button>} /><div className="platforms">{["Windows","macOS","Linux"].map(name=><button className={platform===name?"active":""} onClick={()=>setPlatform(name)} key={name}>{name}</button>)}</div><div className="two-col"><article className="card"><div className="section-head"><div><span className="label">AETHER CORE</span><h3>{probe.available?probe.version:"Not detected"}</h3></div><span className={`availability ${probe.available?"online":"offline"}`}>{probe.available?"READY":"MISSING"}</span></div><TextField label="Core executable" value={profile.corePath??""} placeholder="Auto-detect or absolute path" onChange={(value)=>onChange({...profile,corePath:value||null})}/><p className="field-help">{probe.path??probe.message}</p></article><article className="card"><div className="section-head"><div><span className="label">{(host ?? "System").toUpperCase()}</span><h3>System integration</h3></div></div>
       <ToggleField label="Route system traffic through the proxy" copy={systemProxyCopy(host)} checked={profile.systemProxy} onChange={(checked)=>onChange({...profile,systemProxy:checked})}/>
       <p className="field-help">Applied once the tunnel is up and put back on disconnect. If the app is killed rather than closed, the next launch restores it.</p>
       <SettingRow name="Current frontend" value="SOCKS5"/><SettingRow name="Launch at sign-in" value="Planned"/><SettingRow name="Full-device tunnel" value="Roadmap"/></article></div></>;
@@ -344,16 +344,20 @@ function stateName(value: CoreSnapshot["state"]): string { return ({idle:"Ready"
 function ipName(value: ConnectionProfile["ipFamily"]): string { return value === "both" ? "IPv4 + IPv6" : value === "v4" ? "IPv4 only" : "IPv6 only"; }
 // Which applications follow the setting differs enough per platform that
 // promising "all traffic" would be untrue on every one of them.
-function hostPlatform(runtime: string): string {
+// Null when there is no OS to report -- the browser preview, or a name we do
+// not recognise. Guessing here would describe GNOME to a Windows user.
+function hostPlatform(runtime: string): string | null {
   const os = runtime.split(" · ")[0]?.toLowerCase() ?? "";
   if (os === "windows") return "Windows";
   if (os === "macos") return "macOS";
-  return "Linux";
+  if (os === "linux") return "Linux";
+  return null;
 }
-function systemProxyCopy(platform: string): string {
+function systemProxyCopy(platform: string | null): string {
   if (platform === "Windows") return "Sets the WinINET proxy. Most apps follow it; some bring their own proxy settings.";
   if (platform === "macOS") return "Sets the SOCKS proxy on every active network service.";
-  return "Sets the GNOME proxy. Desktops that do not read gsettings are unaffected.";
+  if (platform === "Linux") return "Sets the GNOME proxy. Desktops that do not read gsettings are unaffected.";
+  return "Sets the operating system's proxy settings once the desktop app reports which platform this is.";
 }
 
 export default App;
