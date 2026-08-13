@@ -47,6 +47,8 @@ export interface ConnectionProfile {
   accessEmail: string | null;
   accessToken: string | null;
   gateway: boolean;
+  /** Point the OS proxy at the SOCKS listener while connected. */
+  systemProxy: boolean;
 }
 
 export interface CoreSnapshot {
@@ -118,6 +120,7 @@ export const DEFAULT_PROFILE: ConnectionProfile = {
   accessEmail: null,
   accessToken: null,
   gateway: false,
+  systemProxy: false,
 };
 
 export const IDLE_SNAPSHOT: CoreSnapshot = {

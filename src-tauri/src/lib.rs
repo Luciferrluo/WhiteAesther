@@ -1,4 +1,5 @@
 mod core_supervisor;
+mod system_proxy;
 
 use core_supervisor::CoreSupervisor;
 use tauri::{
@@ -31,6 +32,15 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(CoreSupervisor::new())
         .setup(|app| {
+            // A previous run that was killed rather than closed may have left
+            // the system proxy pointing at a listener that is now gone, which
+            // takes the machine off the network until it is put back.
+            match system_proxy::recover(app.handle()) {
+                Ok(true) => eprintln!("restored the system proxy left by an earlier run"),
+                Ok(false) => {}
+                Err(error) => eprintln!("could not restore the system proxy: {error}"),
+            }
+
             let open = MenuItem::with_id(app, "open", "Open WhiteAesther", true, None::<&str>)?;
             let connection = MenuItem::with_id(
                 app,
@@ -73,7 +83,7 @@ pub fn run() {
                         let _ = app.emit("tray-action", "open-diagnostics");
                     }
                     "quit" => {
-                        app.state::<CoreSupervisor>().shutdown();
+                        app.state::<CoreSupervisor>().shutdown(app);
                         app.exit(0);
                     }
                     _ => {}
@@ -100,7 +110,8 @@ pub fn run() {
                 let _ = window.hide();
             }
             tauri::WindowEvent::Destroyed => {
-                window.state::<CoreSupervisor>().shutdown();
+                let app = window.app_handle();
+                app.state::<CoreSupervisor>().shutdown(app);
             }
             _ => {}
         })

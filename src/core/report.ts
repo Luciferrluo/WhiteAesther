@@ -125,6 +125,7 @@ function settingsLine(profile: ConnectionProfile): string {
     ["peerPinned", Boolean(profile.peer?.trim())],
     ["zeroTrust", Boolean(profile.team?.trim())],
     ["gateway", profile.gateway],
+    ["systemProxy", profile.systemProxy],
   ];
   return `settings ${values.map(([key, value]) => `${key}=${value}`).join(" ")}`;
 }

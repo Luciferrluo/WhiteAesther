@@ -6,12 +6,13 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use crate::system_proxy;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const MAX_LOGS: usize = 1_000;
@@ -66,6 +67,9 @@ pub struct CoreProfile {
     pub access_email: Option<String>,
     pub access_token: Option<String>,
     pub gateway: bool,
+    /// Point the operating system's proxy settings at the SOCKS5 listener while
+    /// connected, and put them back on disconnect.
+    pub system_proxy: bool,
 }
 
 impl Default for CoreProfile {
@@ -107,6 +111,7 @@ impl Default for CoreProfile {
             access_email: None,
             access_token: None,
             gateway: false,
+            system_proxy: false,
         }
     }
 }
@@ -370,6 +375,8 @@ struct SupervisorInner {
     /// Bumped by every start and every stop. A retry thread that wakes up on a
     /// stale generation has been superseded and does nothing.
     generation: AtomicU64,
+    /// Whether this process has the system proxy pointed at its listener.
+    proxy_applied: AtomicBool,
 }
 
 impl SupervisorInner {
@@ -392,12 +399,13 @@ impl CoreSupervisor {
                 logs: Mutex::new(VecDeque::with_capacity(MAX_LOGS)),
                 session: Mutex::new(None),
                 generation: AtomicU64::new(0),
+                proxy_applied: AtomicBool::new(false),
             }),
         }
     }
 
-    pub fn shutdown(&self) {
-        let _ = stop_inner(&self.inner, None);
+    pub fn shutdown(&self, app: &AppHandle) {
+        let _ = stop_inner(&self.inner, app);
     }
 }
 
@@ -580,7 +588,7 @@ pub fn stop_core(
     app: AppHandle,
     supervisor: State<'_, CoreSupervisor>,
 ) -> Result<CoreSnapshot, String> {
-    stop_inner(&supervisor.inner, Some(&app))?;
+    stop_inner(&supervisor.inner, &app)?;
     Ok(lock(&supervisor.inner.snapshot).clone())
 }
 
@@ -816,6 +824,7 @@ fn give_up(
         "error",
         format!("gave up after {MAX_ATTEMPTS} attempts: {reason}"),
     );
+    clear_system_proxy(app, inner);
 }
 
 /// Decides what happens after a core process ends without the user asking.
@@ -986,8 +995,73 @@ fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: S
     // fresh problem and gets the full retry budget again. Kept out of the
     // snapshot lock above so the two are never held at once.
     if connected {
-        if let Some(session) = lock(&inner.session).as_mut() {
-            session.attempt = 0;
+        let wanted = {
+            let mut guard = lock(&inner.session);
+            match guard.as_mut() {
+                Some(session) => {
+                    session.attempt = 0;
+                    session.profile.system_proxy
+                }
+                None => false,
+            }
+        };
+        if wanted {
+            let socks = lock(&inner.snapshot).socks_address.clone();
+            apply_system_proxy(app, inner, &socks);
+        }
+    }
+}
+
+/// Points the OS at the listener once, on the first log line that says it is up.
+fn apply_system_proxy(app: &AppHandle, inner: &SupervisorInner, socks: &str) {
+    if inner.proxy_applied.load(Ordering::SeqCst) {
+        return;
+    }
+    let Ok(address) = socks.parse::<SocketAddr>() else {
+        supervisor_log(
+            app,
+            inner,
+            "warn",
+            format!("cannot use {socks} as a system proxy address"),
+        );
+        return;
+    };
+    match system_proxy::apply(app, address) {
+        Ok(()) => {
+            inner.proxy_applied.store(true, Ordering::SeqCst);
+            supervisor_log(app, inner, "info", format!("system proxy set to {address}"));
+        }
+        // Worth saying and worth continuing: the tunnel is up either way, and
+        // the SOCKS listener can still be used directly.
+        Err(error) => supervisor_log(
+            app,
+            inner,
+            "warn",
+            format!("could not set the system proxy: {error}"),
+        ),
+    }
+}
+
+/// Puts the OS proxy back, whatever else is going on.
+///
+/// Called on every path that ends a session -- stop, give-up and quit -- because
+/// a proxy left pointing at a listener that no longer exists takes the machine
+/// off the network.
+fn clear_system_proxy(app: &AppHandle, inner: &SupervisorInner) {
+    if !inner.proxy_applied.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    match system_proxy::revert(app) {
+        Ok(()) => supervisor_log(app, inner, "info", "system proxy restored".into()),
+        Err(error) => {
+            // Leave the flag cleared but say so loudly: the backup file stays on
+            // disk, so the next launch will try again.
+            supervisor_log(
+                app,
+                inner,
+                "error",
+                format!("could not restore the system proxy: {error}"),
+            )
         }
     }
 }
@@ -1070,11 +1144,12 @@ fn parse_latency_ms(message: &str) -> Option<f64> {
     None
 }
 
-fn stop_inner(inner: &SupervisorInner, app: Option<&AppHandle>) -> Result<(), String> {
+fn stop_inner(inner: &SupervisorInner, app: &AppHandle) -> Result<(), String> {
     // Invalidate first. A retry sleeping out its backoff has no child to kill,
     // and would otherwise launch a process after the user asked it to stop.
     inner.generation.fetch_add(1, Ordering::SeqCst);
     *lock(&inner.session) = None;
+    clear_system_proxy(app, inner);
 
     let mut child = lock(&inner.child).take();
     if let Some(child) = child.as_mut() {
@@ -1093,9 +1168,7 @@ fn stop_inner(inner: &SupervisorInner, app: Option<&AppHandle>) -> Result<(), St
     snapshot.last_error = None;
     snapshot.status_message = None;
     snapshot.attempt = 0;
-    if let Some(app) = app {
-        emit_snapshot(app, &snapshot);
-    }
+    emit_snapshot(app, &snapshot);
     Ok(())
 }
 

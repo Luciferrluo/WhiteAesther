@@ -16,7 +16,9 @@ Cross-platform desktop control surface for the Aether connection core.
 - Persists profiles locally while keeping Access secrets and tokens memory-only
 - Bundles a target-specific Aether sidecar in Windows, macOS and Linux packages
 
-Operating-system proxy integration and a full-device tunnel remain roadmap items and are labeled as such in the UI.
+- Points the operating system's proxy at the SOCKS5 listener while connected, restores it on disconnect, and repairs it on the next launch if the app was killed
+
+A full-device tunnel remains a roadmap item and is labeled as such in the UI.
 
 ## Development
 
