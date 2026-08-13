@@ -7,7 +7,8 @@ import { Simple } from "@/features/Simple";
 import { type CarryMode, carryFromProfile } from "@/features/carry";
 import {
   getCoreLogs, getCoreStatus, isDesktopRuntime, loadProfile, probeCore, runtimeInfo,
-  saveProfile as persistProfile, startCore, stopCore, subscribeCore, subscribeTrayActions,
+  saveProfile as persistProfile, setSystemProxy, startCore, stopCore, subscribeCore,
+  subscribeTrayActions,
 } from "@/core/api";
 import { withNormalizedEndpoint } from "@/core/endpoint";
 import {
@@ -158,10 +159,23 @@ export default function App() {
   }, [desktop, profile, effective, notify, showError]);
 
   const carry: CarryMode = carryFromProfile(profile.systemProxy);
-  const setCarry = useCallback((next: CarryMode) => {
-    if (next === "tun") return;
-    setProfile((current) => ({ ...current, systemProxy: next === "system" }));
-  }, []);
+  const setCarry = useCallback(
+    (next: CarryMode) => {
+      if (next === "tun") return;
+      const wantsSystem = next === "system";
+      setProfile((current) => ({ ...current, systemProxy: wantsSystem }));
+      // The screen offers this choice while connected, so it has to take effect
+      // then, rather than only at the next connect.
+      if (!desktop || !ACTIVE.has(snapshot.state)) return;
+      void setSystemProxy(wantsSystem)
+        .then((applied) => {
+          if (wantsSystem && applied) notify("Whole machine", "Your system proxy now points at the tunnel.");
+          else if (!wantsSystem) notify("This app only", "Your system proxy has been put back.");
+        })
+        .catch(showError);
+    },
+    [desktop, snapshot.state, notify, showError],
+  );
 
   const retryStealth = useCallback(async () => {
     const next: ConnectionProfile = { ...profile, scanMode: "stealth" };

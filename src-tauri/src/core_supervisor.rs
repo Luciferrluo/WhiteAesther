@@ -12,7 +12,8 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use crate::system_proxy;
+use crate::http_bridge::{self, HttpBridge};
+use crate::system_proxy::{self, ProxyTargets};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const MAX_LOGS: usize = 1_000;
@@ -384,6 +385,9 @@ struct SupervisorInner {
     /// A reporting run of the core -- a scan or an endpoint test. Separate from
     /// `child` because it is short-lived and independently cancellable.
     scan_child: Mutex<Option<Child>>,
+    /// The local HTTP proxy the system proxy points at. Only alive while the
+    /// system proxy is applied, and dropped with it.
+    bridge: Mutex<Option<HttpBridge>>,
 }
 
 impl SupervisorInner {
@@ -408,6 +412,7 @@ impl CoreSupervisor {
                 generation: AtomicU64::new(0),
                 proxy_applied: AtomicBool::new(false),
                 scan_child: Mutex::new(None),
+                bridge: Mutex::new(None),
             }),
         }
     }
@@ -685,6 +690,43 @@ pub async fn stop_core(
         Ok(lock(&inner.snapshot).clone())
     })
     .await
+}
+
+/// Applies or removes the system proxy while a connection is already up.
+///
+/// Without this, choosing "whole machine" after connecting only changed a field
+/// in the profile: the proxy was applied on the log line that reports the
+/// listener, which had already gone by. The screen offers the choice while
+/// connected, so it has to mean something then.
+#[tauri::command]
+pub fn set_system_proxy(
+    app: AppHandle,
+    supervisor: State<'_, CoreSupervisor>,
+    enabled: bool,
+) -> Result<bool, String> {
+    let inner = &supervisor.inner;
+
+    // Remember it for the rest of the session, so a reconnect keeps the choice.
+    if let Some(session) = lock(&inner.session).as_mut() {
+        session.profile.system_proxy = enabled;
+    }
+
+    if !enabled {
+        clear_system_proxy(&app, inner);
+        return Ok(false);
+    }
+
+    let (state, socks) = {
+        let snapshot = lock(&inner.snapshot);
+        (snapshot.state.clone(), snapshot.socks_address.clone())
+    };
+    // Before the listener exists there is nothing to point at; the connect path
+    // applies it when the core reports itself up.
+    if state != "connected" {
+        return Ok(false);
+    }
+    apply_system_proxy(&app, inner, &socks);
+    Ok(inner.proxy_applied.load(Ordering::SeqCst))
 }
 
 #[tauri::command]
@@ -1173,7 +1215,8 @@ fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: S
     }
 }
 
-/// Points the OS at the listener once, on the first log line that says it is up.
+/// Points the OS at the tunnel. Idempotent, so the log-line path and the
+/// change-while-connected path can both call it.
 fn apply_system_proxy(app: &AppHandle, inner: &SupervisorInner, socks: &str) {
     if inner.proxy_applied.load(Ordering::SeqCst) {
         return;
@@ -1187,19 +1230,47 @@ fn apply_system_proxy(app: &AppHandle, inner: &SupervisorInner, socks: &str) {
         );
         return;
     };
-    match system_proxy::apply(app, address) {
+
+    // Windows follows an HTTP proxy and effectively ignores a SOCKS one, so the
+    // bridge is what its settings are pointed at. It costs a listener on
+    // loopback and is torn down with the proxy.
+    let bridge = match http_bridge::start(address) {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            supervisor_log(
+                app,
+                inner,
+                "warn",
+                format!("could not start the local HTTP proxy: {error}"),
+            );
+            return;
+        }
+    };
+    let targets = ProxyTargets { socks: address, http: bridge.address() };
+    *lock(&inner.bridge) = Some(bridge);
+
+    match system_proxy::apply(app, targets) {
         Ok(()) => {
             inner.proxy_applied.store(true, Ordering::SeqCst);
-            supervisor_log(app, inner, "info", format!("system proxy set to {address}"));
+            supervisor_log(
+                app,
+                inner,
+                "info",
+                format!("system proxy set to {} via {}", targets.socks, targets.http),
+            );
         }
         // Worth saying and worth continuing: the tunnel is up either way, and
         // the SOCKS listener can still be used directly.
-        Err(error) => supervisor_log(
-            app,
-            inner,
-            "warn",
-            format!("could not set the system proxy: {error}"),
-        ),
+        Err(error) => {
+            // Nothing is pointed at the bridge, so it has no reason to stay up.
+            lock(&inner.bridge).take();
+            supervisor_log(
+                app,
+                inner,
+                "warn",
+                format!("could not set the system proxy: {error}"),
+            )
+        }
     }
 }
 
@@ -1212,6 +1283,9 @@ fn clear_system_proxy(app: &AppHandle, inner: &SupervisorInner) {
     if !inner.proxy_applied.swap(false, Ordering::SeqCst) {
         return;
     }
+    // Dropped before the settings change, so nothing can be sent to a bridge
+    // that is about to stop answering.
+    lock(&inner.bridge).take();
     match system_proxy::revert(app) {
         Ok(()) => supervisor_log(app, inner, "info", "system proxy restored".into()),
         Err(error) => {

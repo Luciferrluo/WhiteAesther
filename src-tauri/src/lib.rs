@@ -1,4 +1,5 @@
 mod core_supervisor;
+mod http_bridge;
 mod scanner;
 mod system_proxy;
 
@@ -126,6 +127,7 @@ pub fn run() {
             core_supervisor::save_profile,
             core_supervisor::load_profile,
             core_supervisor::save_report,
+            core_supervisor::set_system_proxy,
             scanner::scan_endpoints,
             scanner::test_endpoint,
             scanner::cancel_scan,
