@@ -1,9 +1,13 @@
 name: build, test and release
 
+# A push to a branch with an open pull request matches `pull_request` and `push`
+# both, so every commit on every branch was built twice — three platforms each,
+# around thirteen minutes a job. `pull_request` covers branches; `push` is left
+# with the two refs that actually publish something.
 on:
   pull_request:
   push:
-    branches: ["**"]
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
