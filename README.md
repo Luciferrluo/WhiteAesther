@@ -50,3 +50,12 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 `pnpm test` runs the frontend unit tests on Node's own test runner, with no test framework installed. It covers the diagnostics report, including that redaction removes every address form the core actually logs and leaves timestamps alone.
 
 The Windows end-to-end smoke test also verifies core discovery, live state events, SOCKS5 exposure, a proxied request and clean shutdown.
+
+## Licence
+
+WhiteAesther is licensed under the **GNU Affero General Public License v3.0** — see `LICENSE`. It
+builds on the Aether connection engine, which is AGPL-3.0, so this client is a derivative work and
+its source stays public.
+
+Aether is a trademark of CluvexStudio and the Aether project, used here by written permission. See
+`THIRD_PARTY_NOTICES.md`. WhiteAesther is not an official Aether product.

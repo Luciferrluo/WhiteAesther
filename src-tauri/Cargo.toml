@@ -3,6 +3,9 @@ name = "whiteaesther"
 version = "1.0.0"
 description = "Cross-platform desktop client for the Aether connection core"
 authors = ["WhiteDNS"]
+# WhiteAesther links the Aether engine, which is AGPL-3.0, so it is a derivative
+# work and carries the same licence. See THIRD_PARTY_NOTICES.md.
+license = "AGPL-3.0-or-later"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
