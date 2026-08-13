@@ -74,3 +74,34 @@ export async function subscribeTrayActions(onAction: (action: TrayAction) => voi
   requireDesktop();
   return listen<TrayAction>("tray-action", (event) => onAction(event.payload));
 }
+
+export interface ScanCandidate {
+  peer: string;
+  rttMs: number;
+}
+
+export interface ScanOutcome {
+  candidates: ScanCandidate[];
+  /** Which transport produced these, which is not always the one configured. */
+  transport: string;
+  /** True when the configured transport found nothing and the other was swept. */
+  fellBack: boolean;
+}
+
+/** Ranks reachable gateways without connecting. Rejects while a tunnel is up. */
+export async function scanEndpoints(profile: ConnectionProfile, limit = 8): Promise<ScanOutcome> {
+  requireDesktop();
+  return invoke("scan_endpoints", { profile, limit });
+}
+
+/** Validates one address with a real authenticated handshake. */
+export async function testEndpoint(profile: ConnectionProfile, endpoint: string): Promise<ScanCandidate> {
+  requireDesktop();
+  return invoke("test_endpoint", { profile, endpoint });
+}
+
+/** Kills an in-flight scan. Returns false when there was nothing to stop. */
+export async function cancelScan(): Promise<boolean> {
+  requireDesktop();
+  return invoke("cancel_scan");
+}

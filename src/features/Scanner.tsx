@@ -1,0 +1,196 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { CheckCircle2, Loader2, Radar, Search, X } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { cancelScan, scanEndpoints, testEndpoint, type ScanCandidate } from "@/core/api";
+import { normalizeEndpoint } from "@/core/endpoint";
+import type { ConnectionProfile, CoreSnapshot } from "@/types";
+
+type Phase = "idle" | "scanning" | "testing" | "cancelling";
+
+interface ScannerProps {
+  profile: ConnectionProfile;
+  snapshot: CoreSnapshot;
+  onPick: (endpoint: string) => void;
+  onToast: (title: string, message: string, error?: boolean) => void;
+}
+
+export function Scanner({ profile, snapshot, onPick, onToast }: ScannerProps) {
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [candidates, setCandidates] = useState<ScanCandidate[]>([]);
+  const [note, setNote] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // A scan outlives this panel if the user navigates away mid-search, so the
+  // late result must not be written into an unmounted component.
+  const live = useRef(true);
+  useEffect(() => {
+    live.current = true;
+    return () => { live.current = false; };
+  }, []);
+
+  const busy = phase === "scanning" || phase === "testing";
+  const connected = snapshot.state !== "idle" && snapshot.state !== "stopped" && snapshot.state !== "error";
+  const pinned = normalizeEndpoint(profile.peer ?? "");
+
+  const scan = useCallback(async () => {
+    setPhase("scanning");
+    setError(null);
+    setNote(null);
+    try {
+      const outcome = await scanEndpoints(profile, 8);
+      if (!live.current) return;
+      setCandidates(outcome.candidates);
+      if (outcome.candidates.length === 0) {
+        setNote("Nothing answered on either transport. This network is filtering hard.");
+      } else {
+        setNote(
+          outcome.fellBack
+            ? `Nothing over ${label(profile.masqueTransport)}; these answered over ${label(outcome.transport)}.`
+            : `${outcome.candidates.length} gateway${outcome.candidates.length === 1 ? "" : "s"} answered.`,
+        );
+      }
+    } catch (raw) {
+      if (!live.current) return;
+      const message = raw instanceof Error ? raw.message : String(raw);
+      // Cancelling is a normal outcome, not a failure to shout about.
+      if (message.includes("cancelled")) setNote("Scan cancelled.");
+      else setError(message);
+    } finally {
+      if (live.current) setPhase("idle");
+    }
+  }, [profile]);
+
+  const stop = useCallback(async () => {
+    setPhase("cancelling");
+    try {
+      await cancelScan();
+    } catch {
+      /* the scan finished on its own between the click and the call */
+    }
+  }, []);
+
+  const test = useCallback(async () => {
+    const address = normalizeEndpoint(profile.peer ?? "");
+    if (!address) {
+      setError("Enter a numeric address and port first.");
+      return;
+    }
+    setPhase("testing");
+    setError(null);
+    setNote(null);
+    try {
+      const result = await testEndpoint(profile, address);
+      if (!live.current) return;
+      setNote(`${result.peer} answered in ${result.rttMs} ms.`);
+    } catch (raw) {
+      if (!live.current) return;
+      setError(raw instanceof Error ? raw.message : String(raw));
+    } finally {
+      if (live.current) setPhase("idle");
+    }
+  }, [profile]);
+
+  return (
+    <Card>
+      <CardHeader className="flex-row items-start justify-between gap-4 space-y-0 pb-3">
+        <div className="flex flex-col gap-1.5">
+          <CardTitle className="text-[15px]">Find a gateway</CardTitle>
+          <CardDescription>
+            Tests real gateways and ranks them by round-trip time. Nothing is connected until you pick one.
+          </CardDescription>
+        </div>
+        <div className="flex shrink-0 gap-2">
+          {phase === "scanning" ? (
+            <Button variant="outline" size="sm" onClick={() => void stop()}>
+              <X />
+              Stop
+            </Button>
+          ) : (
+            <Button size="sm" disabled={connected || busy || phase === "cancelling"} onClick={() => void scan()}>
+              {phase === "cancelling" ? <Loader2 className="animate-spin" /> : <Radar />}
+              Scan
+            </Button>
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={connected || busy || !pinned}
+            onClick={() => void test()}
+          >
+            {phase === "testing" ? <Loader2 className="animate-spin" /> : <Search />}
+            Test pinned
+          </Button>
+        </div>
+      </CardHeader>
+
+      <CardContent className="pt-0">
+        {connected ? (
+          <p className="py-2 text-[13px] text-muted-foreground">
+            Disconnect first — scanning while connected competes with the tunnel for the same gateways and
+            reports worse numbers than the network really offers.
+          </p>
+        ) : null}
+
+        {phase === "scanning" ? (
+          <div className="flex items-center gap-2.5 py-3 text-[13px] text-muted-foreground">
+            <Loader2 className="size-4 animate-spin text-primary" />
+            Testing gateways over {label(profile.masqueTransport)}. This takes a while on a filtered network.
+          </div>
+        ) : null}
+
+        {error ? <p className="py-2 text-[13px] text-destructive">{error}</p> : null}
+        {note && !error ? <p className="py-2 text-[13px] text-muted-foreground">{note}</p> : null}
+
+        {candidates.length > 0 ? (
+          <div className="mt-1 flex flex-col overflow-hidden rounded-md border">
+            {candidates.map((candidate, index) => {
+              const chosen = pinned === candidate.peer;
+              return (
+                <button
+                  key={candidate.peer}
+                  type="button"
+                  onClick={() => {
+                    onPick(candidate.peer);
+                    onToast("Endpoint pinned", `${candidate.peer} — set Endpoint mode to use it.`);
+                  }}
+                  className={[
+                    "flex items-center justify-between gap-3 border-b px-3.5 py-2.5 text-left transition-colors last:border-b-0",
+                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                    chosen ? "bg-primary/10" : "hover:bg-accent",
+                  ].join(" ")}
+                >
+                  <div className="flex min-w-0 items-center gap-3">
+                    <span className="tabular w-4 shrink-0 font-mono text-[11px] text-muted-foreground">
+                      {index + 1}
+                    </span>
+                    <span className="truncate font-mono text-[13px]">{candidate.peer}</span>
+                    {chosen ? <CheckCircle2 className="size-4 shrink-0 text-primary" /> : null}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2.5">
+                    <Latency ms={candidate.rttMs} best={candidates[0].rttMs} />
+                    <span className="tabular w-16 text-right font-mono text-[13px]">{candidate.rttMs} ms</span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+/** Relative bar, so the spread between candidates reads without doing the arithmetic. */
+function Latency({ ms, best }: { ms: number; best: number }) {
+  const ratio = Math.min(1, best > 0 ? best / Math.max(ms, 1) : 1);
+  const tone = ms < 120 ? "bg-primary" : ms < 300 ? "bg-warning" : "bg-destructive";
+  return (
+    <span className="hidden h-1.5 w-20 overflow-hidden rounded-full bg-secondary sm:block">
+      <span className={`block h-full rounded-full ${tone}`} style={{ width: `${Math.max(8, ratio * 100)}%` }} />
+    </span>
+  );
+}
+
+function label(transport: string): string {
+  return transport === "h2" ? "MASQUE H2" : "MASQUE H3";
+}

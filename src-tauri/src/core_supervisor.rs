@@ -377,6 +377,9 @@ struct SupervisorInner {
     generation: AtomicU64,
     /// Whether this process has the system proxy pointed at its listener.
     proxy_applied: AtomicBool,
+    /// A reporting run of the core -- a scan or an endpoint test. Separate from
+    /// `child` because it is short-lived and independently cancellable.
+    scan_child: Mutex<Option<Child>>,
 }
 
 impl SupervisorInner {
@@ -400,11 +403,60 @@ impl CoreSupervisor {
                 session: Mutex::new(None),
                 generation: AtomicU64::new(0),
                 proxy_applied: AtomicBool::new(false),
+                scan_child: Mutex::new(None),
             }),
         }
     }
 
+    /// Refuses when a connection is live: a scan competes with it for the same
+    /// gateways and would report worse numbers than the network really offers.
+    pub fn require_idle(&self, message: &str) -> Result<(), String> {
+        let state = lock(&self.inner.snapshot).state.clone();
+        if state == "idle" || state == "stopped" || state == "error" {
+            Ok(())
+        } else {
+            Err(message.to_string())
+        }
+    }
+
+    pub fn hold_scan(&self, child: Child) -> Result<(), String> {
+        let mut guard = lock(&self.inner.scan_child);
+        if guard.is_some() {
+            return Err("a scan is already running".into());
+        }
+        *guard = Some(child);
+        Ok(())
+    }
+
+    pub fn poll_scan(&self) -> crate::scanner::ScanState {
+        let mut guard = lock(&self.inner.scan_child);
+        let Some(child) = guard.as_mut() else {
+            return crate::scanner::ScanState::Gone;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                guard.take();
+                crate::scanner::ScanState::Exited
+            }
+            Ok(None) => crate::scanner::ScanState::Running,
+            Err(_) => {
+                guard.take();
+                crate::scanner::ScanState::Exited
+            }
+        }
+    }
+
+    pub fn cancel_scan(&self) -> bool {
+        let Some(mut child) = lock(&self.inner.scan_child).take() else {
+            return false;
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        true
+    }
+
     pub fn shutdown(&self, app: &AppHandle) {
+        self.cancel_scan();
         let _ = stop_inner(&self.inner, app);
     }
 }
@@ -765,6 +817,28 @@ fn sanitize_report_name(filename: &str) -> Result<String, String> {
         return Err("the report file name is invalid".into());
     }
     Ok(name.to_string())
+}
+
+/// The core executable, the directory it runs in, and the identity file it
+/// uses. Shared so a scan provisions the same identity a connection would,
+/// rather than a second one.
+pub fn core_paths(
+    app: &AppHandle,
+    profile: &CoreProfile,
+) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    let core_path = resolve_core_path(app, profile.core_path.as_deref())?;
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("cannot resolve app config directory: {error}"))?;
+    let identity_dir = config_dir.join("identity");
+    std::fs::create_dir_all(&identity_dir)
+        .map_err(|error| format!("cannot create identity directory: {error}"))?;
+    Ok((core_path, config_dir, identity_dir.join("aether.toml")))
+}
+
+pub fn hide_console(command: &mut Command) {
+    hide_console_window(command);
 }
 
 fn spawn_log_reader<R: Read + Send + 'static>(

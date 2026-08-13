@@ -1,4 +1,5 @@
 mod core_supervisor;
+mod scanner;
 mod system_proxy;
 
 use core_supervisor::CoreSupervisor;
@@ -125,6 +126,9 @@ pub fn run() {
             core_supervisor::save_profile,
             core_supervisor::load_profile,
             core_supervisor::save_report,
+            scanner::scan_endpoints,
+            scanner::test_endpoint,
+            scanner::cancel_scan,
         ])
         .run(tauri::generate_context!())
         .expect("error while running WhiteAesther");

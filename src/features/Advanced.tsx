@@ -12,6 +12,7 @@ import { endpointError, normalizeEndpoint } from "@/core/endpoint";
 import { REPORT_EVENT_LIMIT, buildReport, reportFilename } from "@/core/report";
 import { saveReport } from "@/core/api";
 import { NumberField, Row, RulesField, Seg, TextField } from "./panels";
+import { Scanner } from "./Scanner";
 import { transportName } from "./Simple";
 import {
   ENDPOINT_MODES, type ConnectionProfile, type CoreLogEvent, type CoreProbe, type CoreSnapshot,
@@ -372,16 +373,26 @@ function Routes({ profile, onChange }: AdvancedProps) {
 
 // -------------------------------------------------------------------- endpoint
 
-function Endpoint({ profile, onChange }: AdvancedProps) {
+function Endpoint({ profile, onChange, snapshot, onToast }: AdvancedProps) {
   const set = (patch: Partial<ConnectionProfile>) => onChange({ ...profile, ...patch });
   const error = endpointError(profile.endpointMode, profile.peer ?? "");
   const canonical = normalizeEndpoint(profile.peer ?? "");
   return (
     <>
+      <Scanner
+        profile={profile}
+        snapshot={snapshot}
+        onToast={onToast}
+        // Picking a candidate is only useful if it is actually used, so the mode
+        // moves off Automatic at the same time.
+        onPick={(peer) =>
+          set({ peer, endpointMode: profile.endpointMode === "automatic" ? "custom-first" : profile.endpointMode })
+        }
+      />
       <Card>
         <CardHeader className="pb-1"><CardTitle className="text-[15px]">Pinned endpoint</CardTitle></CardHeader>
         <CardContent className="pt-0">
-          <Row first title="Endpoint" help="Pin a specific gateway, or let the core find one.">
+          <Row first title="How the gateway is chosen" help="Custom first spends one attempt on your address before searching. Custom only never searches.">
             <Seg
               value={profile.endpointMode}
               onChange={(endpointMode) => set({ endpointMode })}

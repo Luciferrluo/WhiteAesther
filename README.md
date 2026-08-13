@@ -14,6 +14,7 @@ Cross-platform desktop control surface for the Aether connection core.
 - Pins a specific endpoint with a choice of falling back to discovery when it fails, or reporting the failure rather than silently substituting
 - Builds a reviewable diagnostics report that redacts addresses by default and carries no Zero Trust credentials
 - Persists profiles locally while keeping Access secrets and tokens memory-only
+- Ranks reachable gateways by round-trip time without connecting, sweeping the other transport when one finds nothing, and pins the one you choose
 - Bundles a target-specific Aether sidecar in Windows, macOS and Linux packages
 
 - Points the operating system's proxy at the SOCKS5 listener while connected, restores it on disconnect, and repairs it on the next launch if the app was killed
@@ -24,7 +25,7 @@ A full-device tunnel remains a roadmap item and is labeled as such in the UI.
 
 Requirements: Node.js 24+, pnpm 10+, Rust 1.88 and the platform-specific Tauri prerequisites. The unit tests are TypeScript run directly on Node's test runner, which needs 22.18 or newer for type stripping; 24 is what CI uses.
 
-Place the Aether repository beside this repository, or set `AETHER_CORE_SOURCE` to an existing Aether executable. Then run:
+The endpoint scanner needs the reporting modes added in [WhiteDNS/Aether](https://github.com/WhiteDNS/Aether), so builds use that fork rather than upstream. Clone it beside this repository as `Aether-whiteaesther`, or set `AETHER_CORE_SOURCE` to an executable built from it. Then run:
 
 ```text
 pnpm install

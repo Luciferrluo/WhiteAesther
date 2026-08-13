@@ -15,7 +15,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  AETHER_REVISION: 21b9872d080bd185600b93ff20b87f3f3e1e7307
+  # The fork adds the reporting modes the endpoint scanner needs. Pinned to a
+  # tag rather than a branch so a release is reproducible.
+  AETHER_REVISION: v1.5.0-whiteaesther.1
 
 jobs:
   package:
@@ -56,7 +58,7 @@ jobs:
       - name: Check out the pinned Aether core
         uses: actions/checkout@v7
         with:
-          repository: MatinSenPai/Aether
+          repository: WhiteDNS/Aether
           ref: ${{ env.AETHER_REVISION }}
           path: aether-core
 

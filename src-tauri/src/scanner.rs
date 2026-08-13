@@ -1,0 +1,203 @@
+//! Asks the core which gateways are reachable, without connecting to one.
+//!
+//! The core answers `--scan-only` and `--test-endpoint` with a single JSON
+//! object on stdout and exits. Running it as a child rather than linking the
+//! engine keeps this crate free of the C++ toolchain BoringSSL needs, and keeps
+//! the connection path — which supports protocols the embedded API does not —
+//! exactly as it was.
+
+use crate::core_supervisor::{CoreProfile, CoreSupervisor};
+use serde::Serialize;
+use std::{
+    io::Read,
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
+};
+use tauri::{AppHandle, State};
+
+/// The core's own cap; asking for more is silently reduced, so mirror it here.
+const MAX_CANDIDATES: u32 = 64;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanCandidate {
+    pub peer: String,
+    pub rtt_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanOutcome {
+    pub candidates: Vec<ScanCandidate>,
+    /// Which transport actually produced them, which is not always the one asked for.
+    pub transport: String,
+    /// Set when the first transport found nothing and the other was swept instead.
+    pub fell_back: bool,
+}
+
+#[tauri::command]
+pub async fn scan_endpoints(
+    app: AppHandle,
+    supervisor: State<'_, CoreSupervisor>,
+    profile: CoreProfile,
+    limit: u32,
+) -> Result<ScanOutcome, String> {
+    supervisor.require_idle("Disconnect before scanning for endpoints")?;
+    let inner: CoreSupervisor = (*supervisor).clone();
+    let limit = limit.clamp(1, MAX_CANDIDATES);
+    tauri::async_runtime::spawn_blocking(move || scan_blocking(&app, &inner, &profile, limit))
+        .await
+        .map_err(|error| format!("the scan did not finish: {error}"))?
+}
+
+#[tauri::command]
+pub async fn test_endpoint(
+    app: AppHandle,
+    supervisor: State<'_, CoreSupervisor>,
+    profile: CoreProfile,
+    endpoint: String,
+) -> Result<ScanCandidate, String> {
+    supervisor.require_idle("Disconnect before testing an endpoint")?;
+    let inner: CoreSupervisor = (*supervisor).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let value = run_report(
+            &app,
+            &inner,
+            &profile,
+            &["--test-endpoint".into(), endpoint],
+            "h2",
+        )?;
+        candidate_from(&value).ok_or_else(|| "the core gave an unreadable answer".to_string())
+    })
+    .await
+    .map_err(|error| format!("the test did not finish: {error}"))?
+}
+
+#[tauri::command]
+pub fn cancel_scan(supervisor: State<'_, CoreSupervisor>) -> bool {
+    supervisor.cancel_scan()
+}
+
+fn scan_blocking(
+    app: &AppHandle,
+    supervisor: &CoreSupervisor,
+    profile: &CoreProfile,
+    limit: u32,
+) -> Result<ScanOutcome, String> {
+    let configured = if profile.masque_transport == "h2" { "h2" } else { "h3" };
+    let args = vec!["--scan-only".to_string(), "--scan-limit".into(), limit.to_string()];
+
+    let first = run_report(app, supervisor, profile, &args, configured)?;
+    let candidates = candidates_from(&first);
+    if !candidates.is_empty() {
+        return Ok(ScanOutcome { candidates, transport: configured.into(), fell_back: false });
+    }
+
+    // The prober picks its socket from the transport it is handed: H2 probes
+    // over TCP, H3 over QUIC. Scanning only the configured one therefore
+    // searches UDP alone on the default profile, and a network that blocks UDP
+    // reports an empty internet. Sweep the other before believing that.
+    let other = if configured == "h2" { "h3" } else { "h2" };
+    let second = run_report(app, supervisor, profile, &args, other)?;
+    Ok(ScanOutcome {
+        candidates: candidates_from(&second),
+        transport: other.into(),
+        fell_back: true,
+    })
+}
+
+/// Runs the core in a reporting mode and returns the JSON object it printed.
+fn run_report(
+    app: &AppHandle,
+    supervisor: &CoreSupervisor,
+    profile: &CoreProfile,
+    extra: &[String],
+    transport: &str,
+) -> Result<serde_json::Value, String> {
+    let (core_path, config_dir, identity_path) = crate::core_supervisor::core_paths(app, profile)?;
+
+    let mut command = Command::new(&core_path);
+    command
+        .arg("--masque")
+        .args(["--scan", &profile.scan_mode])
+        .args(["--ip", &profile.ip_family])
+        .args(["--noize", &profile.noize])
+        .args(["--config", &identity_path.to_string_lossy()])
+        .args(["--log-level", "warn"])
+        .args(extra)
+        .current_dir(&config_dir)
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if transport == "h2" {
+        command.arg("--h2");
+    }
+    crate::core_supervisor::hide_console(&mut command);
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot run the core: {error}"))?;
+    let stdout = child.stdout.take();
+
+    supervisor.hold_scan(child)?;
+    let reader = thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut stdout) = stdout {
+            let _ = stdout.read_to_string(&mut text);
+        }
+        text
+    });
+
+    // Polled rather than waited on, so a cancel can take the child out from
+    // under this loop and kill it.
+    loop {
+        thread::sleep(Duration::from_millis(150));
+        match supervisor.poll_scan() {
+            ScanState::Gone => return Err("the scan was cancelled".into()),
+            ScanState::Running => continue,
+            ScanState::Exited => break,
+        }
+    }
+
+    let text = reader.join().unwrap_or_default();
+    let line = text
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| "the core reported nothing".to_string())?;
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| format!("the core gave an unreadable answer: {error}"))?;
+
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("the scan failed")
+            .to_string());
+    }
+    Ok(value)
+}
+
+pub enum ScanState {
+    Running,
+    Exited,
+    /// Taken by a cancel.
+    Gone,
+}
+
+fn candidates_from(value: &serde_json::Value) -> Vec<ScanCandidate> {
+    value
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.iter().filter_map(candidate_from).collect())
+        .unwrap_or_default()
+}
+
+fn candidate_from(value: &serde_json::Value) -> Option<ScanCandidate> {
+    Some(ScanCandidate {
+        peer: value.get("peer")?.as_str()?.to_string(),
+        rtt_ms: value.get("rttMs")?.as_u64()?,
+    })
+}
