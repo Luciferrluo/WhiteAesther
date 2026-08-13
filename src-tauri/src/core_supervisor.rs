@@ -299,7 +299,7 @@ impl CoreProfile {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoreSnapshot {
     pub state: String,
@@ -417,10 +417,36 @@ pub fn runtime_info() -> serde_json::Value {
     })
 }
 
+/// Runs `body` on the blocking pool and reports a joining failure through the
+/// same error channel the body itself uses.
+async fn off_thread<T, F>(what: &str, body: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    match tauri::async_runtime::spawn_blocking(body).await {
+        Ok(result) => result,
+        Err(error) => Err(format!("{what} did not finish: {error}")),
+    }
+}
+
 #[tauri::command]
-pub fn probe_core(app: AppHandle, profile: Option<CoreProfile>) -> CoreProbe {
+pub async fn probe_core(app: AppHandle, profile: Option<CoreProfile>) -> CoreProbe {
+    // Spawns `aether --version` and waits for it. On the main thread that is a
+    // frozen window, and it runs before every connect.
+    off_thread("the core check", move || Ok(probe_core_blocking(&app, profile)))
+        .await
+        .unwrap_or_else(|error| CoreProbe {
+            available: false,
+            path: None,
+            version: None,
+            message: error,
+        })
+}
+
+fn probe_core_blocking(app: &AppHandle, profile: Option<CoreProfile>) -> CoreProbe {
     let requested = profile.and_then(|value| value.core_path);
-    match resolve_core_path(&app, requested.as_deref()) {
+    match resolve_core_path(app, requested.as_deref()) {
         Ok(path) => match core_version(&path) {
             Ok(version) => CoreProbe {
                 available: true,
@@ -445,29 +471,38 @@ pub fn probe_core(app: AppHandle, profile: Option<CoreProfile>) -> CoreProbe {
 }
 
 #[tauri::command]
-pub fn start_core(
+pub async fn start_core(
     app: AppHandle,
     supervisor: State<'_, CoreSupervisor>,
+    profile: CoreProfile,
+) -> Result<CoreSnapshot, String> {
+    let inner = supervisor.inner.clone();
+    off_thread("starting the core", move || start_core_blocking(&app, &inner, profile)).await
+}
+
+fn start_core_blocking(
+    app: &AppHandle,
+    inner: &Arc<SupervisorInner>,
     profile: CoreProfile,
 ) -> Result<CoreSnapshot, String> {
     profile.validate()?;
     // A session waiting out a retry delay has no live child, so checking the
     // child alone would let a second connection start underneath the first.
-    if lock(&supervisor.inner.child).is_some() || lock(&supervisor.inner.session).is_some() {
+    if lock(&inner.child).is_some() || lock(&inner.session).is_some() {
         return Err("Aether core is already running".into());
     }
 
-    let generation = supervisor.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
-    *lock(&supervisor.inner.session) = Some(Session {
+    let generation = inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    *lock(&inner.session) = Some(Session {
         generation,
         profile: profile.clone(),
         attempt: 0,
     });
 
-    match launch(&app, &supervisor.inner, &profile, 0, generation) {
-        Ok(()) => Ok(lock(&supervisor.inner.snapshot).clone()),
+    match launch(app, inner, &profile, 0, generation) {
+        Ok(()) => Ok(lock(&inner.snapshot).clone()),
         Err(error) => {
-            *lock(&supervisor.inner.session) = None;
+            *lock(&inner.session) = None;
             Err(error)
         }
     }
@@ -584,12 +619,16 @@ fn launch(
 }
 
 #[tauri::command]
-pub fn stop_core(
+pub async fn stop_core(
     app: AppHandle,
     supervisor: State<'_, CoreSupervisor>,
 ) -> Result<CoreSnapshot, String> {
-    stop_inner(&supervisor.inner, &app)?;
-    Ok(lock(&supervisor.inner.snapshot).clone())
+    let inner = supervisor.inner.clone();
+    off_thread("stopping the core", move || {
+        stop_inner(&inner, &app)?;
+        Ok(lock(&inner.snapshot).clone())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -603,7 +642,11 @@ pub fn core_logs(supervisor: State<'_, CoreSupervisor>) -> Vec<CoreLogEvent> {
 }
 
 #[tauri::command]
-pub fn save_profile(app: AppHandle, profile: CoreProfile) -> Result<CoreProfile, String> {
+pub async fn save_profile(app: AppHandle, profile: CoreProfile) -> Result<CoreProfile, String> {
+    off_thread("saving the profile", move || save_profile_blocking(app, profile)).await
+}
+
+fn save_profile_blocking(app: AppHandle, profile: CoreProfile) -> Result<CoreProfile, String> {
     profile.validate()?;
     let mut stored = profile.clone();
     stored.access_client_secret = None;
@@ -620,7 +663,11 @@ pub fn save_profile(app: AppHandle, profile: CoreProfile) -> Result<CoreProfile,
 }
 
 #[tauri::command]
-pub fn load_profile(app: AppHandle) -> Result<CoreProfile, String> {
+pub async fn load_profile(app: AppHandle) -> Result<CoreProfile, String> {
+    off_thread("loading the profile", move || load_profile_blocking(app)).await
+}
+
+fn load_profile_blocking(app: AppHandle) -> Result<CoreProfile, String> {
     let path = profile_path(&app)?;
     if !path.exists() {
         return Ok(CoreProfile::default());
@@ -663,7 +710,22 @@ fn migrate_endpoint_mode(stored: &mut serde_json::Value) {
 /// anywhere. The name is supplied by the caller so the timestamp carries the
 /// user's locale, which is why it is sanitised rather than trusted.
 #[tauri::command]
-pub fn save_report(app: AppHandle, contents: String, filename: String) -> Result<String, String> {
+pub async fn save_report(
+    app: AppHandle,
+    contents: String,
+    filename: String,
+) -> Result<String, String> {
+    off_thread("saving the report", move || {
+        save_report_blocking(&app, contents, filename)
+    })
+    .await
+}
+
+fn save_report_blocking(
+    app: &AppHandle,
+    contents: String,
+    filename: String,
+) -> Result<String, String> {
     if contents.trim().is_empty() {
         return Err("the report is empty".into());
     }
@@ -982,13 +1044,18 @@ fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: S
 
     let connected = {
         let mut snapshot = lock(&inner.snapshot);
+        let before = snapshot.clone();
         apply_log_to_snapshot(&message, &mut snapshot);
         let connected = snapshot.state == "connected";
         if connected {
             snapshot.attempt = 0;
             snapshot.status_message = None;
         }
-        emit_snapshot(app, &snapshot);
+        // Most log lines change nothing. Emitting regardless meant two IPC
+        // messages and a full re-render for every line the core printed.
+        if *snapshot != before {
+            emit_snapshot(app, &snapshot);
+        }
         connected
     };
     // A tunnel that came up has spent its failures. Anything after this is a
