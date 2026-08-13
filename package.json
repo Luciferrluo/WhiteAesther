@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "check": "tsc --noEmit",
+    "test": "node --test \"src/**/*.test.ts\"",
     "preview": "vite preview",
     "stage:core": "node scripts/stage-core.mjs",
     "desktop:dev": "pnpm stage:core && tauri dev",
@@ -27,6 +28,7 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
+    "@types/node": "^26.2.0",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",

@@ -1,6 +1,13 @@
 export type ViewId = "overview" | "lab" | "discovery" | "transports" | "routing" | "identity" | "diagnostics" | "preferences";
 export type ConnectionPhase = "h2" | "h3" | "wg";
 export type CoreState = "idle" | "starting" | "scanning" | "connecting" | "connected" | "reconnecting" | "stopped" | "error";
+export type EndpointMode = "automatic" | "custom-first" | "custom-only";
+
+export const ENDPOINT_MODES: Array<{ id: EndpointMode; label: string; detail: string }> = [
+  { id: "automatic", label: "Automatic", detail: "Let the core find a working edge." },
+  { id: "custom-first", label: "Custom first", detail: "Try the pinned address once, then search." },
+  { id: "custom-only", label: "Custom only", detail: "Use the pinned address or fail." },
+];
 
 export interface ConnectionProfile {
   name: string;
@@ -26,6 +33,8 @@ export interface ConnectionProfile {
   noize: "off" | "light" | "firewall" | "balanced" | "gfw" | "aggressive";
   profileRetry: boolean;
   logLevel: "error" | "warn" | "info" | "debug" | "trace";
+  /** How `peer` is used. "automatic" ignores it entirely. */
+  endpointMode: EndpointMode;
   peer: string | null;
   wgPeer: string | null;
   corePath: string | null;
@@ -51,11 +60,16 @@ export interface CoreSnapshot {
   latencyMs: number | null;
   startedAt: number | null;
   lastError: string | null;
+  /** What the supervisor is doing right now, including the retry countdown. */
+  statusMessage: string | null;
+  attempt: number;
+  maxAttempts: number;
 }
 
 export interface CoreLogEvent {
   timestamp: number;
-  stream: "stdout" | "stderr";
+  /** "supervisor" is WhiteAesther itself: retries, give-ups, session configuration. */
+  stream: "stdout" | "stderr" | "supervisor";
   level: "error" | "warn" | "info" | "debug" | "trace";
   message: string;
 }
@@ -91,6 +105,7 @@ export const DEFAULT_PROFILE: ConnectionProfile = {
   noize: "balanced",
   profileRetry: true,
   logLevel: "info",
+  endpointMode: "automatic",
   peer: null,
   wgPeer: null,
   corePath: null,
@@ -116,4 +131,7 @@ export const IDLE_SNAPSHOT: CoreSnapshot = {
   latencyMs: null,
   startedAt: null,
   lastError: null,
+  statusMessage: null,
+  attempt: 0,
+  maxAttempts: 8,
 };

@@ -5,13 +5,25 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const MAX_LOGS: usize = 1_000;
+/// A permanently refused identity would otherwise retry forever, which reads on
+/// screen as an endless "connecting" and keeps the network busy for nothing.
+const MAX_ATTEMPTS: u32 = 8;
+/// 3s, 6s, 12s, 24s, 48s, then a minute between attempts.
+const BASE_RETRY_SECS: u64 = 3;
+const MAX_RETRY_SECS: u64 = 60;
+/// Comfortably above a full 1,000-line log with the header, and far below
+/// anything that would be a surprise to write to disk.
+const MAX_REPORT_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -39,6 +51,9 @@ pub struct CoreProfile {
     pub noize: String,
     pub profile_retry: bool,
     pub log_level: String,
+    /// How `peer` is used: "automatic" ignores it, "custom-first" falls back to
+    /// discovery once it fails, "custom-only" never falls back.
+    pub endpoint_mode: String,
     pub peer: Option<String>,
     pub wg_peer: Option<String>,
     pub core_path: Option<String>,
@@ -79,6 +94,7 @@ impl Default for CoreProfile {
             noize: "balanced".into(),
             profile_retry: true,
             log_level: "info".into(),
+            endpoint_mode: "automatic".into(),
             peer: None,
             wg_peer: None,
             core_path: None,
@@ -120,6 +136,14 @@ impl CoreProfile {
             &self.performance_profile,
             &["auto", "low", "medium", "high"],
         )?;
+        require_one_of(
+            "endpoint mode",
+            &self.endpoint_mode,
+            &["automatic", "custom-first", "custom-only"],
+        )?;
+        if self.endpoint_mode != "automatic" && non_empty(self.peer.as_deref()).is_none() {
+            return Err("pinning an endpoint requires a custom address".into());
+        }
 
         self.socks_address
             .parse::<SocketAddr>()
@@ -166,6 +190,20 @@ impl CoreProfile {
         Ok(())
     }
 
+    /// The log level the child process actually runs at.
+    ///
+    /// Connection state, the selected edge and the latency are all derived from
+    /// info-level core output. Running the child below info suppresses exactly
+    /// the lines the supervisor reads, which leaves a perfectly healthy tunnel
+    /// showing as "starting" forever. Extra verbosity is passed through, so the
+    /// control only ever adds detail.
+    fn process_log_level(&self) -> &str {
+        match self.log_level.as_str() {
+            "debug" | "trace" => self.log_level.as_str(),
+            _ => "info",
+        }
+    }
+
     fn args(&self, identity_path: &Path) -> Vec<String> {
         let mut args = vec![
             format!("--{}", self.protocol),
@@ -188,7 +226,7 @@ impl CoreProfile {
             "--keepalive".into(),
             self.keepalive_secs.to_string(),
             "--log-level".into(),
-            self.log_level.clone(),
+            self.process_log_level().into(),
             "--config".into(),
             identity_path.to_string_lossy().into_owned(),
         ];
@@ -217,8 +255,13 @@ impl CoreProfile {
         if !self.profile_retry {
             args.push("--no-profile-retry".into());
         }
-        if let Some(peer) = non_empty(self.peer.as_deref()) {
-            args.extend(["--peer".into(), peer.into()]);
+        // Only when the user asked for it. The address is kept in the profile
+        // across a fallback so it is still in the field when they come back to
+        // it, and passing it regardless would make the fallback do nothing.
+        if self.endpoint_mode != "automatic" {
+            if let Some(peer) = non_empty(self.peer.as_deref()) {
+                args.extend(["--peer".into(), peer.into()]);
+            }
         }
         if let Some(peer) = non_empty(self.wg_peer.as_deref()) {
             args.extend(["--wg-peer".into(), peer.into()]);
@@ -264,6 +307,12 @@ pub struct CoreSnapshot {
     pub latency_ms: Option<f64>,
     pub started_at: Option<u64>,
     pub last_error: Option<String>,
+    /// What the supervisor is doing right now, in the user's words. Carries the
+    /// retry countdown, so a slow recovery is visibly progress rather than a stall.
+    pub status_message: Option<String>,
+    /// 0 while the first launch is in flight, then the retry number.
+    pub attempt: u32,
+    pub max_attempts: u32,
 }
 
 impl Default for CoreSnapshot {
@@ -279,6 +328,9 @@ impl Default for CoreSnapshot {
             latency_ms: None,
             started_at: None,
             last_error: None,
+            status_message: None,
+            attempt: 0,
+            max_attempts: MAX_ATTEMPTS,
         }
     }
 }
@@ -301,10 +353,29 @@ pub struct CoreProbe {
     pub message: String,
 }
 
+/// One connection the user asked for, across however many process launches it
+/// takes. The profile is the one they configured, before any per-attempt
+/// transport substitution, so retries never compound.
+struct Session {
+    generation: u64,
+    profile: CoreProfile,
+    attempt: u32,
+}
+
 struct SupervisorInner {
     child: Mutex<Option<Child>>,
     snapshot: Mutex<CoreSnapshot>,
     logs: Mutex<VecDeque<CoreLogEvent>>,
+    session: Mutex<Option<Session>>,
+    /// Bumped by every start and every stop. A retry thread that wakes up on a
+    /// stale generation has been superseded and does nothing.
+    generation: AtomicU64,
+}
+
+impl SupervisorInner {
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::SeqCst) == generation
+    }
 }
 
 #[derive(Clone)]
@@ -319,6 +390,8 @@ impl CoreSupervisor {
                 child: Mutex::new(None),
                 snapshot: Mutex::new(CoreSnapshot::default()),
                 logs: Mutex::new(VecDeque::with_capacity(MAX_LOGS)),
+                session: Mutex::new(None),
+                generation: AtomicU64::new(0),
             }),
         }
     }
@@ -370,11 +443,40 @@ pub fn start_core(
     profile: CoreProfile,
 ) -> Result<CoreSnapshot, String> {
     profile.validate()?;
-    if lock(&supervisor.inner.child).is_some() {
+    // A session waiting out a retry delay has no live child, so checking the
+    // child alone would let a second connection start underneath the first.
+    if lock(&supervisor.inner.child).is_some() || lock(&supervisor.inner.session).is_some() {
         return Err("Aether core is already running".into());
     }
 
-    let core_path = resolve_core_path(&app, profile.core_path.as_deref())?;
+    let generation = supervisor.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    *lock(&supervisor.inner.session) = Some(Session {
+        generation,
+        profile: profile.clone(),
+        attempt: 0,
+    });
+
+    match launch(&app, &supervisor.inner, &profile, 0, generation) {
+        Ok(()) => Ok(lock(&supervisor.inner.snapshot).clone()),
+        Err(error) => {
+            *lock(&supervisor.inner.session) = None;
+            Err(error)
+        }
+    }
+}
+
+/// Starts one Aether process for `profile` and wires its output back.
+///
+/// `profile` is the profile for this attempt, which is not necessarily the one
+/// the user configured -- see [`profile_for_attempt`].
+fn launch(
+    app: &AppHandle,
+    inner: &Arc<SupervisorInner>,
+    profile: &CoreProfile,
+    attempt: u32,
+    generation: u64,
+) -> Result<(), String> {
+    let core_path = resolve_core_path(app, profile.core_path.as_deref())?;
     let version = core_version(&core_path)?;
     let config_dir = app
         .path()
@@ -424,32 +526,53 @@ pub fn start_core(
     let stderr = child.stderr.take();
 
     {
-        let mut snapshot = lock(&supervisor.inner.snapshot);
+        // A stop that landed while this process was being spawned has nothing to
+        // kill yet, so claim the slot and re-check under the same lock the stop
+        // takes. Otherwise the child outlives the session and runs unsupervised.
+        let mut guard = lock(&inner.child);
+        if !inner.is_current(generation) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(());
+        }
+        *guard = Some(child);
+    }
+
+    {
+        let mut snapshot = lock(&inner.snapshot);
         *snapshot = CoreSnapshot {
             state: "starting".into(),
             pid: Some(pid),
             core_path: Some(core_path.to_string_lossy().into_owned()),
             version: Some(version),
-            transport: Some(transport_label(&profile).into()),
+            transport: Some(transport_label(profile).into()),
             endpoint: None,
             socks_address: profile.socks_address.clone(),
             latency_ms: None,
             started_at: Some(now_millis()),
             last_error: None,
+            status_message: (attempt > 0).then(|| {
+                format!(
+                    "Attempt {attempt} of {MAX_ATTEMPTS} on {}",
+                    transport_name(profile)
+                )
+            }),
+            attempt,
+            max_attempts: MAX_ATTEMPTS,
         };
-        emit_snapshot(&app, &snapshot);
+        emit_snapshot(app, &snapshot);
     }
-    *lock(&supervisor.inner.child) = Some(child);
+    supervisor_log(app, inner, "info", session_summary(profile, attempt));
 
     if let Some(stdout) = stdout {
-        spawn_log_reader(app.clone(), supervisor.inner.clone(), stdout, "stdout");
+        spawn_log_reader(app.clone(), inner.clone(), stdout, "stdout");
     }
     if let Some(stderr) = stderr {
-        spawn_log_reader(app.clone(), supervisor.inner.clone(), stderr, "stderr");
+        spawn_log_reader(app.clone(), inner.clone(), stderr, "stderr");
     }
-    spawn_exit_monitor(app.clone(), supervisor.inner.clone());
+    spawn_exit_monitor(app.clone(), inner.clone(), generation);
 
-    Ok(lock(&supervisor.inner.snapshot).clone())
+    Ok(())
 }
 
 #[tauri::command]
@@ -495,10 +618,83 @@ pub fn load_profile(app: AppHandle) -> Result<CoreProfile, String> {
         return Ok(CoreProfile::default());
     }
     let bytes = std::fs::read(&path).map_err(|error| format!("cannot read profile: {error}"))?;
-    let profile: CoreProfile =
+    let mut stored: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|error| format!("profile is invalid: {error}"))?;
+    migrate_endpoint_mode(&mut stored);
+    let profile: CoreProfile =
+        serde_json::from_value(stored).map_err(|error| format!("profile is invalid: {error}"))?;
     profile.validate()?;
     Ok(profile)
+}
+
+/// Keeps a profile saved before endpoint modes existed behaving as it did.
+///
+/// Back then any address in `peer` was passed to the core unconditionally, so a
+/// profile carrying one was pinned whether or not it said so. Defaulting those
+/// to "automatic" would quietly stop honouring an address the user had set.
+fn migrate_endpoint_mode(stored: &mut serde_json::Value) {
+    let Some(object) = stored.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("endpointMode") {
+        return;
+    }
+    let pinned = object
+        .get("peer")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|peer| !peer.trim().is_empty());
+    if pinned {
+        object.insert("endpointMode".into(), "custom-only".into());
+    }
+}
+
+/// Writes a diagnostics report the user has already reviewed to disk.
+///
+/// The contents are composed and redacted in the UI and shown verbatim before
+/// this is ever called -- nothing is gathered here, and nothing is sent
+/// anywhere. The name is supplied by the caller so the timestamp carries the
+/// user's locale, which is why it is sanitised rather than trusted.
+#[tauri::command]
+pub fn save_report(app: AppHandle, contents: String, filename: String) -> Result<String, String> {
+    if contents.trim().is_empty() {
+        return Err("the report is empty".into());
+    }
+    if contents.len() > MAX_REPORT_BYTES {
+        return Err("the report is too large to save".into());
+    }
+    let name = sanitize_report_name(&filename)?;
+    let directory = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("cannot resolve app config directory: {error}"))?
+        .join("reports");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot create the reports directory: {error}"))?;
+    let path = directory.join(name);
+    std::fs::write(&path, contents).map_err(|error| format!("cannot save the report: {error}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Reduces a caller-supplied name to a plain file name in the reports
+/// directory. Anything that could climb out of it is rejected rather than
+/// rewritten, so a surprising name fails loudly instead of writing somewhere
+/// unexpected.
+fn sanitize_report_name(filename: &str) -> Result<String, String> {
+    let name = filename.trim();
+    if name.is_empty() || name.len() > 128 {
+        return Err("the report file name is invalid".into());
+    }
+    if !name.ends_with(".txt") {
+        return Err("reports are saved as .txt".into());
+    }
+    if name.starts_with('.')
+        || !name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err("the report file name is invalid".into());
+    }
+    Ok(name.to_string())
 }
 
 fn spawn_log_reader<R: Read + Send + 'static>(
@@ -514,11 +710,16 @@ fn spawn_log_reader<R: Read + Send + 'static>(
     });
 }
 
-fn spawn_exit_monitor(app: AppHandle, inner: Arc<SupervisorInner>) {
+fn spawn_exit_monitor(app: AppHandle, inner: Arc<SupervisorInner>, generation: u64) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(350));
+        if !inner.is_current(generation) {
+            return;
+        }
         let exit = {
             let mut guard = lock(&inner.child);
+            // Taken by a stop, or by a newer session. Either way this process is
+            // no longer the one being supervised.
             let Some(child) = guard.as_mut() else {
                 return;
             };
@@ -536,30 +737,216 @@ fn spawn_exit_monitor(app: AppHandle, inner: Arc<SupervisorInner>) {
         };
 
         let Some(exit) = exit else { continue };
-        let mut snapshot = lock(&inner.snapshot);
-        snapshot.pid = None;
-        match exit {
-            Ok(status) if status.success() => snapshot.state = "stopped".into(),
-            Ok(status) => {
-                snapshot.state = "error".into();
-                snapshot.last_error = Some(format!("Aether core exited with {status}"));
-            }
-            Err(error) => {
-                snapshot.state = "error".into();
-                snapshot.last_error = Some(format!("cannot monitor Aether core: {error}"));
-            }
-        }
-        emit_snapshot(&app, &snapshot);
+        let reason = match exit {
+            Ok(status) if status.success() => "The Aether core exited".to_string(),
+            Ok(status) => format!("The Aether core exited with {status}"),
+            Err(error) => format!("Cannot monitor the Aether core: {error}"),
+        };
+        handle_exit(&app, &inner, generation, reason);
         return;
     });
 }
 
-fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: String) {
+#[derive(Debug)]
+enum ExitDecision {
+    Retry { attempt: u32, profile: CoreProfile },
+    GiveUp { profile: CoreProfile },
+    /// The exit belongs to a session that has been superseded or stopped.
+    Ignore,
+}
+
+/// Advances the session's retry count and says what should happen next.
+///
+/// Clearing a spent session has to be conditional on it still being *this*
+/// session: a stop and a fresh start can both land between a core exiting and
+/// this running, and unconditionally clearing would throw away the new
+/// session's retry budget while leaving it connected.
+fn decide_exit(session: &mut Option<Session>, generation: u64) -> ExitDecision {
+    let Some(current) = session.as_mut() else {
+        return ExitDecision::Ignore;
+    };
+    if current.generation != generation {
+        return ExitDecision::Ignore;
+    }
+    current.attempt += 1;
+    let attempt = current.attempt;
+    let profile = current.profile.clone();
+    if attempt > MAX_ATTEMPTS {
+        *session = None;
+        return ExitDecision::GiveUp { profile };
+    }
+    ExitDecision::Retry { attempt, profile }
+}
+
+fn give_up(
+    app: &AppHandle,
+    inner: &Arc<SupervisorInner>,
+    generation: u64,
+    profile: &CoreProfile,
+    reason: String,
+) {
+    // Every attempt went to the same pinned address, so naming it is more use
+    // than repeating the core's last error.
+    let summary = if profile.endpoint_mode == "custom-only" {
+        format!(
+            "The pinned endpoint {} never answered. Stopped after {MAX_ATTEMPTS} attempts — switch \
+             Endpoint back to Automatic to search instead.",
+            profile.peer.as_deref().unwrap_or("(unset)")
+        )
+    } else {
+        format!("{reason}. Stopped after {MAX_ATTEMPTS} attempts.")
+    };
+    {
+        let mut snapshot = lock(&inner.snapshot);
+        // A stop bumps the generation before it takes this lock, so a stale
+        // generation here means the idle snapshot is the newer truth.
+        if !inner.is_current(generation) {
+            return;
+        }
+        snapshot.state = "error".into();
+        snapshot.pid = None;
+        snapshot.status_message = None;
+        snapshot.attempt = 0;
+        snapshot.last_error = Some(summary);
+        emit_snapshot(app, &snapshot);
+    }
+    supervisor_log(
+        app,
+        inner,
+        "error",
+        format!("gave up after {MAX_ATTEMPTS} attempts: {reason}"),
+    );
+}
+
+/// Decides what happens after a core process ends without the user asking.
+///
+/// Retries on a widening delay and eventually stops, rather than either giving
+/// up on the first failure -- which is what a hostile network produces -- or
+/// retrying a dead configuration forever.
+fn handle_exit(app: &AppHandle, inner: &Arc<SupervisorInner>, generation: u64, reason: String) {
+    // Bound to its own statement so the session lock is released before
+    // anything below reaches for another one.
+    let decision = decide_exit(&mut lock(&inner.session), generation);
+    let (attempt, base_profile) = match decision {
+        ExitDecision::Ignore => return,
+        ExitDecision::GiveUp { profile } => return give_up(app, inner, generation, &profile, reason),
+        ExitDecision::Retry { attempt, profile } => (attempt, profile),
+    };
+
+    let profile = profile_for_attempt(&base_profile, attempt);
+    let delay = retry_delay(attempt);
+    // A pinned address that quietly stops being used is the one substitution a
+    // user has to be told about -- otherwise the connection they are looking at
+    // is not the one they asked for.
+    let fell_back = fell_back_to_discovery(&base_profile, &profile);
+    {
+        let mut snapshot = lock(&inner.snapshot);
+        if !inner.is_current(generation) {
+            return;
+        }
+        snapshot.state = "reconnecting".into();
+        snapshot.pid = None;
+        snapshot.attempt = attempt;
+        snapshot.status_message = Some(if fell_back {
+            format!(
+                "The pinned endpoint failed · searching for a working one · retry {attempt} of \
+                 {MAX_ATTEMPTS} on {} in {}s",
+                transport_name(&profile),
+                delay.as_secs()
+            )
+        } else {
+            format!(
+                "{reason} · retry {attempt} of {MAX_ATTEMPTS} on {} in {}s",
+                transport_name(&profile),
+                delay.as_secs()
+            )
+        });
+        emit_snapshot(app, &snapshot);
+    }
+    if fell_back {
+        supervisor_log(
+            app,
+            inner,
+            "warn",
+            format!(
+                "custom endpoint {} failed; falling back to automatic discovery",
+                base_profile.peer.as_deref().unwrap_or("(unset)")
+            ),
+        );
+    }
+    supervisor_log(
+        app,
+        inner,
+        "warn",
+        format!(
+            "{reason}; retry {attempt} of {MAX_ATTEMPTS} on {} in {}s",
+            transport_label(&profile),
+            delay.as_secs()
+        ),
+    );
+
+    let app = app.clone();
+    let inner = inner.clone();
+    thread::spawn(move || {
+        // Woken in slices so a stop during a minute-long backoff is felt at once
+        // rather than after the full delay.
+        let deadline = Instant::now() + delay;
+        while Instant::now() < deadline {
+            if !inner.is_current(generation) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        if !inner.is_current(generation) {
+            return;
+        }
+        if let Err(error) = launch(&app, &inner, &profile, attempt, generation) {
+            handle_exit(&app, &inner, generation, error);
+        }
+    });
+}
+
+/// The profile to launch for a given retry.
+///
+/// The core takes one transport and never falls back between them. H3 rides
+/// QUIC, and a network that blocks UDP kills it outright -- so retrying the same
+/// dead transport eight times is eight guaranteed failures. Alternate instead:
+/// the configured transport on odd attempts, the other one on even. Only MASQUE
+/// has a second transport to alternate to.
+fn profile_for_attempt(base: &CoreProfile, attempt: u32) -> CoreProfile {
+    let mut profile = base.clone();
+    if attempt > 0 && base.protocol == "masque" && attempt % 2 == 0 {
+        profile.masque_transport = if base.masque_transport == "h2" {
+            "h3".into()
+        } else {
+            "h2".into()
+        };
+    }
+    // "Custom first" means exactly one go at the pinned address. Retrying it
+    // eight times is what the mode exists to avoid -- if it were reachable the
+    // first attempt would have worked.
+    if attempt > 0 && base.endpoint_mode == "custom-first" {
+        profile.endpoint_mode = "automatic".into();
+    }
+    profile
+}
+
+/// Whether this attempt gave up on the pinned address the previous one used.
+fn fell_back_to_discovery(base: &CoreProfile, attempted: &CoreProfile) -> bool {
+    base.endpoint_mode == "custom-first" && attempted.endpoint_mode == "automatic"
+}
+
+fn retry_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    Duration::from_secs((BASE_RETRY_SECS << shift).min(MAX_RETRY_SECS))
+}
+
+fn push_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, level: &str, message: String) {
     let event = CoreLogEvent {
         timestamp: now_millis(),
         stream: stream.into(),
-        level: log_level(&message).into(),
-        message: message.trim().to_string(),
+        level: level.into(),
+        message,
     };
     {
         let mut logs = lock(&inner.logs);
@@ -569,10 +956,40 @@ fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: S
         logs.push_back(event.clone());
     }
     let _ = app.emit("core-log", &event);
+}
 
-    let mut snapshot = lock(&inner.snapshot);
-    apply_log_to_snapshot(&event.message, &mut snapshot);
-    emit_snapshot(app, &snapshot);
+/// What the supervisor itself did, as opposed to what the core printed.
+///
+/// Retries, give-ups and the configuration a session ran with leave no trace in
+/// the core's own output, so without these a diagnostics report cannot answer
+/// the question it was collected for.
+fn supervisor_log(app: &AppHandle, inner: &SupervisorInner, level: &str, message: String) {
+    push_log(app, inner, "supervisor", level, message);
+}
+
+fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: String) {
+    let message = message.trim().to_string();
+    push_log(app, inner, stream, log_level(&message), message.clone());
+
+    let connected = {
+        let mut snapshot = lock(&inner.snapshot);
+        apply_log_to_snapshot(&message, &mut snapshot);
+        let connected = snapshot.state == "connected";
+        if connected {
+            snapshot.attempt = 0;
+            snapshot.status_message = None;
+        }
+        emit_snapshot(app, &snapshot);
+        connected
+    };
+    // A tunnel that came up has spent its failures. Anything after this is a
+    // fresh problem and gets the full retry budget again. Kept out of the
+    // snapshot lock above so the two are never held at once.
+    if connected {
+        if let Some(session) = lock(&inner.session).as_mut() {
+            session.attempt = 0;
+        }
+    }
 }
 
 fn apply_log_to_snapshot(message: &str, snapshot: &mut CoreSnapshot) {
@@ -654,6 +1071,11 @@ fn parse_latency_ms(message: &str) -> Option<f64> {
 }
 
 fn stop_inner(inner: &SupervisorInner, app: Option<&AppHandle>) -> Result<(), String> {
+    // Invalidate first. A retry sleeping out its backoff has no child to kill,
+    // and would otherwise launch a process after the user asked it to stop.
+    inner.generation.fetch_add(1, Ordering::SeqCst);
+    *lock(&inner.session) = None;
+
     let mut child = lock(&inner.child).take();
     if let Some(child) = child.as_mut() {
         child
@@ -669,6 +1091,8 @@ fn stop_inner(inner: &SupervisorInner, app: Option<&AppHandle>) -> Result<(), St
     snapshot.latency_ms = None;
     snapshot.started_at = None;
     snapshot.last_error = None;
+    snapshot.status_message = None;
+    snapshot.attempt = 0;
     if let Some(app) = app {
         emit_snapshot(app, &snapshot);
     }
@@ -758,6 +1182,43 @@ fn transport_label(profile: &CoreProfile) -> &'static str {
         ("masque", _) => "masque-h3",
         ("wg", _) => "wireguard",
         _ => "warp-in-warp",
+    }
+}
+
+/// What this attempt is actually configured with.
+///
+/// Zero Trust credentials are deliberately reduced to whether one is set. The
+/// line ends up in diagnostics reports that leave the machine, and a team name
+/// identifies the user even though it is not itself a secret.
+fn session_summary(profile: &CoreProfile, attempt: u32) -> String {
+    format!(
+        "session transport={} scan={} ip={} noize={} fragment={} dataCheck={} quickReconnect={} \
+         perf={} validate={}s startup={}s endpoint={} peerPinned={} zeroTrust={} gateway={} \
+         attempt={attempt}",
+        transport_label(profile),
+        profile.scan_mode,
+        profile.ip_family,
+        profile.noize,
+        profile.fragment_client_hello,
+        profile.data_check,
+        profile.quick_reconnect,
+        profile.performance_profile,
+        profile.validate_secs,
+        profile.startup_secs,
+        profile.endpoint_mode,
+        non_empty(profile.peer.as_deref()).is_some(),
+        non_empty(profile.team.as_deref()).is_some(),
+        profile.gateway,
+    )
+}
+
+/// The same transport, for a line the user reads.
+fn transport_name(profile: &CoreProfile) -> &'static str {
+    match transport_label(profile) {
+        "masque-h2" => "MASQUE H2",
+        "masque-h3" => "MASQUE H3",
+        "wireguard" => "WireGuard",
+        _ => "WARP in WARP",
     }
 }
 
@@ -924,5 +1385,244 @@ mod tests {
         profile = CoreProfile::default();
         profile.fragment_size = "32-16".into();
         assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn state_detection_survives_a_quiet_log_level() {
+        // Below info the core stops printing the lines the snapshot is derived
+        // from, so the process floor is info however quiet the profile asks for.
+        for level in ["error", "warn", "info"] {
+            let mut profile = CoreProfile::default();
+            profile.log_level = level.into();
+            profile.validate().unwrap();
+            assert_eq!(profile.process_log_level(), "info");
+        }
+        let mut profile = CoreProfile::default();
+        profile.log_level = "trace".into();
+        assert_eq!(profile.process_log_level(), "trace");
+        let args = profile.args(Path::new("identity.toml"));
+        assert!(args.windows(2).any(|pair| pair == ["--log-level", "trace"]));
+    }
+
+    #[test]
+    fn retries_alternate_masque_transports() {
+        let profile = CoreProfile::default();
+        assert_eq!(profile.masque_transport, "h2");
+        // The configured transport on odd attempts, the other on even, so a
+        // network that blocks UDP is not retried eight times over QUIC.
+        for (attempt, expected) in [(0, "h2"), (1, "h2"), (2, "h3"), (3, "h2"), (4, "h3")] {
+            assert_eq!(
+                profile_for_attempt(&profile, attempt).masque_transport,
+                expected,
+                "attempt {attempt}",
+            );
+        }
+    }
+
+    #[test]
+    fn retries_leave_single_transport_protocols_alone() {
+        let mut profile = CoreProfile::default();
+        profile.protocol = "wg".into();
+        for attempt in 0..=MAX_ATTEMPTS {
+            let attempted = profile_for_attempt(&profile, attempt);
+            assert_eq!(attempted.protocol, "wg");
+            assert_eq!(attempted.masque_transport, profile.masque_transport);
+        }
+    }
+
+    #[test]
+    fn alternating_transport_rebuilds_the_arguments_for_it() {
+        let profile = CoreProfile::default();
+        let h2 = profile_for_attempt(&profile, 1).args(Path::new("identity.toml"));
+        let h3 = profile_for_attempt(&profile, 2).args(Path::new("identity.toml"));
+        assert!(h2.contains(&"--h2".to_string()));
+        assert!(h2.contains(&"--fragment".to_string()));
+        // Fragmentation is an HTTP/2 measure; carrying it onto QUIC would pass
+        // the core an argument that does not apply to the transport it is using.
+        assert!(!h3.contains(&"--h2".to_string()));
+        assert!(!h3.contains(&"--fragment".to_string()));
+    }
+
+    fn session(generation: u64, attempt: u32) -> Option<Session> {
+        Some(Session {
+            generation,
+            profile: CoreProfile::default(),
+            attempt,
+        })
+    }
+
+    #[test]
+    fn exits_count_up_to_the_limit_then_give_up() {
+        let mut current = session(1, 0);
+        for expected in 1..=MAX_ATTEMPTS {
+            match decide_exit(&mut current, 1) {
+                ExitDecision::Retry { attempt, .. } => assert_eq!(attempt, expected),
+                other => panic!("attempt {expected} decided {other:?}"),
+            }
+        }
+        assert!(matches!(
+            decide_exit(&mut current, 1),
+            ExitDecision::GiveUp { .. }
+        ));
+        // Giving up ends the session, so a later stray exit changes nothing.
+        assert!(current.is_none());
+        assert!(matches!(decide_exit(&mut current, 1), ExitDecision::Ignore));
+    }
+
+    #[test]
+    fn a_late_exit_never_disturbs_a_newer_session() {
+        // A stop and a fresh start can both land between a core exiting and the
+        // supervisor noticing. The old generation must not touch the new
+        // session -- clearing it would silently cost the new connection every
+        // retry it is entitled to.
+        let mut current = session(2, MAX_ATTEMPTS);
+        assert!(matches!(decide_exit(&mut current, 1), ExitDecision::Ignore));
+        assert_eq!(current.as_ref().unwrap().generation, 2);
+        assert_eq!(current.as_ref().unwrap().attempt, MAX_ATTEMPTS);
+
+        let mut stopped = None;
+        assert!(matches!(decide_exit(&mut stopped, 1), ExitDecision::Ignore));
+    }
+
+    fn pinned(mode: &str) -> CoreProfile {
+        let mut profile = CoreProfile::default();
+        profile.endpoint_mode = mode.into();
+        profile.peer = Some("162.159.192.18:443".into());
+        profile
+    }
+
+    #[test]
+    fn an_address_is_only_forced_when_the_mode_asks_for_it() {
+        let mut automatic = CoreProfile::default();
+        automatic.peer = Some("162.159.192.18:443".into());
+        automatic.validate().unwrap();
+        let args = automatic.args(Path::new("identity.toml"));
+        assert!(!args.contains(&"--peer".to_string()), "{args:?}");
+
+        for mode in ["custom-first", "custom-only"] {
+            let profile = pinned(mode);
+            profile.validate().unwrap();
+            let args = profile.args(Path::new("identity.toml"));
+            assert!(args.windows(2).any(|pair| pair == ["--peer", "162.159.192.18:443"]));
+        }
+    }
+
+    #[test]
+    fn pinning_an_endpoint_requires_an_address() {
+        for mode in ["custom-first", "custom-only"] {
+            let mut profile = CoreProfile::default();
+            profile.endpoint_mode = mode.into();
+            assert!(profile.validate().is_err(), "{mode} accepted an empty peer");
+            profile.peer = Some("   ".into());
+            assert!(profile.validate().is_err(), "{mode} accepted a blank peer");
+        }
+        let mut unknown = CoreProfile::default();
+        unknown.endpoint_mode = "custom".into();
+        assert!(unknown.validate().is_err());
+    }
+
+    #[test]
+    fn custom_first_stops_pinning_after_one_failure() {
+        let base = pinned("custom-first");
+        let first = profile_for_attempt(&base, 0);
+        assert_eq!(first.endpoint_mode, "custom-first");
+        assert!(first.args(Path::new("i.toml")).contains(&"--peer".to_string()));
+        assert!(!fell_back_to_discovery(&base, &first));
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            let retry = profile_for_attempt(&base, attempt);
+            assert_eq!(retry.endpoint_mode, "automatic", "attempt {attempt}");
+            assert!(!retry.args(Path::new("i.toml")).contains(&"--peer".to_string()));
+            assert!(fell_back_to_discovery(&base, &retry));
+            // The address stays in the profile so it is still in the field the
+            // user typed it into.
+            assert_eq!(retry.peer.as_deref(), Some("162.159.192.18:443"));
+        }
+    }
+
+    #[test]
+    fn custom_only_keeps_pinning_for_every_attempt() {
+        let base = pinned("custom-only");
+        for attempt in 0..=MAX_ATTEMPTS {
+            let retry = profile_for_attempt(&base, attempt);
+            assert_eq!(retry.endpoint_mode, "custom-only", "attempt {attempt}");
+            assert!(retry.args(Path::new("i.toml")).contains(&"--peer".to_string()));
+            assert!(!fell_back_to_discovery(&base, &retry));
+        }
+    }
+
+    #[test]
+    fn fallback_and_transport_alternation_apply_together() {
+        // Independent axes: a pinned H2 endpoint that fails should be retried
+        // over H3 discovery, not just one or the other.
+        let base = pinned("custom-first");
+        let second = profile_for_attempt(&base, 2);
+        assert_eq!(second.endpoint_mode, "automatic");
+        assert_eq!(second.masque_transport, "h3");
+    }
+
+    #[test]
+    fn a_profile_saved_before_endpoint_modes_keeps_forcing_its_address() {
+        let mut stored = serde_json::json!({"peer": "162.159.192.18:443"});
+        migrate_endpoint_mode(&mut stored);
+        assert_eq!(stored["endpointMode"], "custom-only");
+
+        // Nothing pinned, nothing to preserve.
+        let mut empty = serde_json::json!({"peer": ""});
+        migrate_endpoint_mode(&mut empty);
+        assert!(empty.get("endpointMode").is_none());
+        let mut none = serde_json::json!({"name": "Adaptive"});
+        migrate_endpoint_mode(&mut none);
+        assert!(none.get("endpointMode").is_none());
+
+        // An explicit choice is never overwritten.
+        let mut explicit =
+            serde_json::json!({"peer": "162.159.192.18:443", "endpointMode": "custom-first"});
+        migrate_endpoint_mode(&mut explicit);
+        assert_eq!(explicit["endpointMode"], "custom-first");
+    }
+
+    #[test]
+    fn report_names_cannot_climb_out_of_the_reports_directory() {
+        assert_eq!(
+            sanitize_report_name("whiteaesther-20260812-140301.txt").unwrap(),
+            "whiteaesther-20260812-140301.txt"
+        );
+        for rejected in [
+            "../escape.txt",
+            "..\\escape.txt",
+            "sub/dir.txt",
+            "report.exe",
+            ".hidden.txt",
+            "report.txt\0",
+            "",
+        ] {
+            assert!(
+                sanitize_report_name(rejected).is_err(),
+                "accepted {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_summary_never_carries_zero_trust_values() {
+        let mut profile = CoreProfile::default();
+        profile.team = Some("acme".into());
+        profile.access_client_secret = Some("super-secret".into());
+        profile.access_token = Some("token-value".into());
+        profile.access_email = Some("someone@example.com".into());
+        let summary = session_summary(&profile, 0);
+        assert!(summary.contains("zeroTrust=true"));
+        for secret in ["acme", "super-secret", "token-value", "someone@example.com"] {
+            assert!(!summary.contains(secret), "{secret} leaked into {summary}");
+        }
+    }
+
+    #[test]
+    fn retry_delay_widens_then_settles() {
+        let delays: Vec<u64> = (1..=MAX_ATTEMPTS)
+            .map(|attempt| retry_delay(attempt).as_secs())
+            .collect();
+        assert_eq!(delays, vec![3, 6, 12, 24, 48, 60, 60, 60]);
     }
 }

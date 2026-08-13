@@ -52,6 +52,12 @@ export async function saveProfile(profile: ConnectionProfile): Promise<Connectio
   return invoke("save_profile", { profile });
 }
 
+/** Writes an already-composed, already-reviewed report and returns its path. */
+export async function saveReport(contents: string, filename: string): Promise<string> {
+  requireDesktop();
+  return invoke("save_report", { contents, filename });
+}
+
 export async function subscribeCore(
   onStatus: (status: CoreSnapshot) => void,
   onLog: (log: CoreLogEvent) => void,

@@ -10,13 +10,15 @@ import { Button } from "./components/ui/button";
 import { Switch } from "./components/ui/switch";
 import {
   getCoreLogs, getCoreStatus, isDesktopRuntime, loadProfile, probeCore, runtimeInfo,
-  saveProfile as persistProfile, startCore, stopCore, subscribeCore, subscribeTrayActions,
+  saveProfile as persistProfile, saveReport, startCore, stopCore, subscribeCore, subscribeTrayActions,
 } from "./core/api";
-import { buildCoreCommand } from "./core/command";
+import { buildCoreCommand, processLogLevel } from "./core/command";
+import { REPORT_EVENT_LIMIT, buildReport, reportFilename } from "./core/report";
 import {
-  DEFAULT_PROFILE, IDLE_SNAPSHOT, type ConnectionPhase, type ConnectionProfile,
+  DEFAULT_PROFILE, ENDPOINT_MODES, IDLE_SNAPSHOT, type ConnectionPhase, type ConnectionProfile,
   type CoreLogEvent, type CoreProbe, type CoreSnapshot, type ViewId,
 } from "./types";
+import { endpointError, normalizeEndpoint, withNormalizedEndpoint } from "./core/endpoint";
 import "./App.css";
 
 const navigation: Array<{ id: ViewId; label: string; icon: typeof Gauge; group?: string }> = [
@@ -50,7 +52,10 @@ function App() {
   const [logs, setLogs] = useState<CoreLogEvent[]>([]);
   const [runtime, setRuntime] = useState("Desktop shell");
   const [toast, setToast] = useState<{ title: string; message: string; error?: boolean } | null>(null);
-  const command = useMemo(() => buildCoreCommand(profile), [profile]);
+  // The command shown and the command run come from the same value, so the
+  // preview cannot claim one address while the core is handed another.
+  const effectiveProfile = useMemo(() => withNormalizedEndpoint(profile), [profile]);
+  const command = useMemo(() => buildCoreCommand(effectiveProfile), [effectiveProfile]);
   const desktop = isDesktopRuntime();
   const running = activeStates.has(snapshot.state);
 
@@ -144,7 +149,7 @@ function App() {
       }
       const latestProbe = await refreshProbe();
       if (!latestProbe?.available) throw new Error(latestProbe?.message ?? "Aether core is unavailable");
-      setSnapshot(await startCore(profile));
+      setSnapshot(await startCore(effectiveProfile));
     } catch (error) {
       showError(error);
     }
@@ -193,7 +198,7 @@ function App() {
           {view === "transports" && <Transports profile={profile} onChange={setProfile} />}
           {view === "routing" && <Routing profile={profile} onChange={setProfile} />}
           {view === "identity" && <Identity profile={profile} onChange={setProfile} />}
-          {view === "diagnostics" && <Diagnostics snapshot={snapshot} logs={logs} />}
+          {view === "diagnostics" && <Diagnostics snapshot={snapshot} logs={logs} profile={profile} probe={probe} runtime={runtime} onSaved={(message) => setToast({ title: "Report ready", message })} onError={showError} />}
           {view === "preferences" && <Preferences profile={profile} onChange={setProfile} probe={probe} onProbe={() => refreshProbe()} />}
         </div>
       </main>
@@ -206,20 +211,21 @@ function Overview({ snapshot, profile, probe, onConnect, onOpenLab }: { snapshot
   const connected = snapshot.state === "connected";
   const busy = activeStates.has(snapshot.state) && !connected;
   const phase = currentPhase(snapshot, profile);
-  const statusLabel = connected ? `Connected · ${transportName(snapshot.transport)}` : busy ? stateName(snapshot.state) : snapshot.state === "error" ? "Core stopped with an error" : probe.available ? "Ready to search" : "Aether core required";
+  const retrying = snapshot.attempt > 0;
+  const statusLabel = connected ? `Connected · ${transportName(snapshot.transport)}` : busy ? retrying ? `${stateName(snapshot.state)} · attempt ${snapshot.attempt} of ${snapshot.maxAttempts}` : stateName(snapshot.state) : snapshot.state === "error" ? "Core stopped with an error" : probe.available ? "Ready to search" : "Aether core required";
   return <>
     <section className="status-panel">
       <div className="connect-zone">
         <div className="status-heading"><span className={`status-indicator ${connected ? "connected" : busy ? "scanning" : snapshot.state === "error" ? "error" : ""}`} />{statusLabel}<Badge>SOCKS5</Badge></div>
         <h2>{connected ? <>A healthy route<br />is active.</> : busy ? <>Aether is testing<br />real network paths.</> : <>Find the route that works<br />on this network.</>}</h2>
-        <p>{connected ? `${transportName(snapshot.transport)} · ${snapshot.endpoint ?? "edge active"} · ${profile.ipFamily.toUpperCase()}` : snapshot.lastError ?? probe.message}</p>
+        <p>{connected ? `${transportName(snapshot.transport)} · ${snapshot.endpoint ?? "edge active"} · ${profile.ipFamily.toUpperCase()}` : snapshot.statusMessage ?? snapshot.lastError ?? probe.message}</p>
         <Button size="large" onClick={onConnect}><ScanSearch />{activeStates.has(snapshot.state) ? "Stop Aether" : "Find best connection"}<kbd>Ctrl ↵</kbd></Button>
         <small className="privacy"><LockKeyhole />Identity, settings and logs remain on this device.</small>
       </div>
       <div className="route-card">
         <div className="section-head"><div><span className="label">SEARCH STRATEGY</span><h3>{profile.name}</h3></div><button onClick={onOpenLab}>Tune</button></div>
         <div className="route-stack">{(["h2", "h3", "wg"] as ConnectionPhase[]).map((item, index) => <div className={`route-step ${phase === item && busy ? "testing" : ""} ${phase === item && connected ? "passed" : ""}`} key={item}><span>0{index + 1}</span><div><strong>{phaseCopy[item].label}</strong><small>{phaseCopy[item].detail}</small></div><em>{phase === item ? connected ? "ACTIVE" : busy ? "TESTING" : "SELECTED" : index === 0 ? "FIRST" : "OPTION"}</em></div>)}</div>
-        <div className="roadmap"><Command /><div><strong>Automatic cross-transport failover</strong><span>The supervisor currently launches the selected core transport.</span></div><Badge tone="roadmap">NEXT SLICE</Badge></div>
+        <div className="roadmap"><Command /><div><strong>Automatic cross-transport failover</strong><span>{profile.protocol === "masque" ? `Retries alternate ${phaseCopy[profile.masqueTransport].label} with the other MASQUE transport, up to ${snapshot.maxAttempts} attempts.` : `Retries relaunch ${profile.protocol === "wg" ? "WireGuard" : "WARP in WARP"}, up to ${snapshot.maxAttempts} attempts.`}</span></div><Badge tone="current">FUNCTIONAL</Badge></div>
       </div>
     </section>
     <section className="metric-grid"><Metric icon={Clock3} value={snapshot.latencyMs == null ? "—" : `${snapshot.latencyMs.toFixed(1)} ms`} label="Selected-edge latency" note="CORE" /><Metric icon={PackageCheck} value="—" label="Packet loss" note="NOT EXPOSED" /><Metric icon={TimerReset} value={`${profile.reconnectSecs}.0 s`} label="Recovery delay" note="PROFILE" /><Metric icon={Network} value={snapshot.socksAddress} label="SOCKS endpoint" note={connected ? "LISTENING" : "CONFIGURED"} /></section>
@@ -245,11 +251,23 @@ function ConnectionLab({ profile, onChange, command, onCopy, onRun }: { profile:
 }
 
 function GlobalTuning({ profile, onChange }: ProfileProps) {
-  return <article className="card global"><div className="section-head"><div><span className="label">GLOBAL TUNING</span><h3>Selection and validation</h3></div></div><div className="form-grid four"><SelectField label="IP family" value={profile.ipFamily} onChange={(value)=>onChange({...profile,ipFamily:value as ConnectionProfile["ipFamily"]})} options={[["both","IPv4 + IPv6"],["v4","IPv4 only"],["v6","IPv6 only"]]} /><SelectField label="Scan mode" value={profile.scanMode} onChange={(value)=>onChange({...profile,scanMode:value as ConnectionProfile["scanMode"]})} options={["turbo","balanced","thorough","stealth","ironclad"].map(value=>[value,value])} /><NumberField label="Validation deadline" value={profile.validateSecs} min={1} max={120} unit="sec" onChange={(value)=>onChange({...profile,validateSecs:value})} /><NumberField label="Startup deadline" value={profile.startupSecs} min={5} max={300} unit="sec" onChange={(value)=>onChange({...profile,startupSecs:value})} /><NumberField label="Reconnect delay" value={profile.reconnectSecs} min={0} max={120} unit="sec" onChange={(value)=>onChange({...profile,reconnectSecs:value})} /><TextField label="Forced peer" value={profile.peer ?? ""} placeholder="Automatic · IP:port" onChange={(value)=>onChange({...profile,peer:value||null})} /><TextField label="SOCKS address" value={profile.socksAddress} onChange={(value)=>onChange({...profile,socksAddress:value})} /><SelectField label="Log level" value={profile.logLevel} onChange={(value)=>onChange({...profile,logLevel:value as ConnectionProfile["logLevel"]})} options={["error","warn","info","debug","trace"].map(value=>[value,value])} /><SelectField label="Performance" value={profile.performanceProfile} onChange={(value)=>onChange({...profile,performanceProfile:value as ConnectionProfile["performanceProfile"]})} options={[["auto","Automatic"],["low","Low resource"],["medium","Desktop"],["high","High concurrency"]]} /></div><div className="toggle-row"><div><strong>Quick reconnect</strong><span>Verify the last healthy edge before scanning.</span></div><Switch checked={profile.quickReconnect} onCheckedChange={(checked)=>onChange({...profile,quickReconnect:checked})} /></div></article>;
+  return <article className="card global"><div className="section-head"><div><span className="label">GLOBAL TUNING</span><h3>Selection and validation</h3></div></div><div className="form-grid four"><SelectField label="IP family" value={profile.ipFamily} onChange={(value)=>onChange({...profile,ipFamily:value as ConnectionProfile["ipFamily"]})} options={[["both","IPv4 + IPv6"],["v4","IPv4 only"],["v6","IPv6 only"]]} /><SelectField label="Scan mode" value={profile.scanMode} onChange={(value)=>onChange({...profile,scanMode:value as ConnectionProfile["scanMode"]})} options={["turbo","balanced","thorough","stealth","ironclad"].map(value=>[value,value])} /><NumberField label="Validation deadline" value={profile.validateSecs} min={1} max={120} unit="sec" onChange={(value)=>onChange({...profile,validateSecs:value})} /><NumberField label="Startup deadline" value={profile.startupSecs} min={5} max={300} unit="sec" onChange={(value)=>onChange({...profile,startupSecs:value})} /><NumberField label="Reconnect delay" value={profile.reconnectSecs} min={0} max={120} unit="sec" onChange={(value)=>onChange({...profile,reconnectSecs:value})} /><TextField label="SOCKS address" value={profile.socksAddress} onChange={(value)=>onChange({...profile,socksAddress:value})} /><SelectField label="Log level" value={profile.logLevel} onChange={(value)=>onChange({...profile,logLevel:value as ConnectionProfile["logLevel"]})} options={["error","warn","info","debug","trace"].map(value=>[value,value])} hint={processLogLevel(profile.logLevel) === profile.logLevel ? undefined : "Runs at info — connection state is read from info-level output."} /><SelectField label="Performance" value={profile.performanceProfile} onChange={(value)=>onChange({...profile,performanceProfile:value as ConnectionProfile["performanceProfile"]})} options={[["auto","Automatic"],["low","Low resource"],["medium","Desktop"],["high","High concurrency"]]} /></div><div className="toggle-row"><div><strong>Quick reconnect</strong><span>Verify the last healthy edge before scanning.</span></div><Switch checked={profile.quickReconnect} onCheckedChange={(checked)=>onChange({...profile,quickReconnect:checked})} /></div></article>;
 }
 
 function Discovery({ profile, onChange }: ProfileProps) {
-  return <><PageIntro badge="CORE TODAY" title="Endpoint discovery" copy="Aether owns concurrency and candidate budgets; the exposed controls below are live." /><div className="two-col"><article className="card"><div className="section-head"><div><span className="label">SCAN POLICY</span><h3>Coverage</h3></div></div><div className="form-grid two"><SelectField label="Scan mode" value={profile.scanMode} onChange={(value)=>onChange({...profile,scanMode:value as ConnectionProfile["scanMode"]})} options={["turbo","balanced","thorough","stealth","ironclad"].map(value=>[value,value])}/><SelectField label="Address family" value={profile.ipFamily} onChange={(value)=>onChange({...profile,ipFamily:value as ConnectionProfile["ipFamily"]})} options={[["both","IPv4 + IPv6"],["v4","IPv4 only"],["v6","IPv6 only"]]}/></div><SettingRow name="Probe parallelism" value="Core resource profile" /><SettingRow name="Candidate budget" value="Core scan mode" /></article><article className="card"><div className="section-head"><div><span className="label">ACCEPTANCE</span><h3>Winner criteria</h3></div></div><NumberField label="Data-plane deadline" value={profile.validateSecs} min={1} max={120} unit="sec" onChange={(value)=>onChange({...profile,validateSecs:value})}/><ToggleField label="End-to-end data check" copy="Expose SOCKS only after a real tunneled request succeeds." checked={profile.dataCheck} onChange={(checked)=>onChange({...profile,dataCheck:checked})}/><SettingRow name="Cache policy" value={profile.quickReconnect?"Verify before reuse":"Always scan fresh"} /></article></div></>;
+  const pinError = endpointError(profile.endpointMode, profile.peer ?? "");
+  const canonical = normalizeEndpoint(profile.peer ?? "");
+  return <><PageIntro badge="CORE TODAY" title="Endpoint discovery" copy="Aether owns concurrency and candidate budgets; the exposed controls below are live." />
+    <article className="card"><div className="section-head"><div><span className="label">ENDPOINT</span><h3>Where the tunnel connects</h3></div><Badge tone={profile.endpointMode === "automatic" ? "current" : "roadmap"}>{profile.endpointMode === "automatic" ? "SEARCHING" : "PINNED"}</Badge></div>
+      <div className="endpoint-modes">{ENDPOINT_MODES.map((mode)=><button key={mode.id} className={`preset ${profile.endpointMode===mode.id?"selected":""}`} onClick={()=>onChange({...profile,endpointMode:mode.id})}><Waypoints /><strong>{mode.label}</strong><span>{mode.detail}</span></button>)}</div>
+      {profile.endpointMode !== "automatic" && <>
+        <TextField label="Endpoint address" value={profile.peer ?? ""} placeholder="162.159.192.18:443" onChange={(value)=>onChange({...profile,peer:value||null})} />
+        {pinError ? <p className="field-help error">{pinError}</p>
+          : <p className="field-help">{canonical && canonical !== profile.peer?.trim() ? `Reads as ${canonical}.` : "A numeric address and port."} {profile.endpointMode === "custom-first" ? "One attempt goes here; if it fails the core searches instead, and the status line says so." : "Every attempt goes here. Nothing else is tried."}</p>}
+      </>}
+      {profile.endpointMode === "automatic" && profile.peer?.trim() && <p className="field-help">A saved address is kept but not used while this is Automatic.</p>}
+    </article>
+    <div className="two-col"><article className="card"><div className="section-head"><div><span className="label">SCAN POLICY</span><h3>Coverage</h3></div></div><div className="form-grid two"><SelectField label="Scan mode" value={profile.scanMode} onChange={(value)=>onChange({...profile,scanMode:value as ConnectionProfile["scanMode"]})} options={["turbo","balanced","thorough","stealth","ironclad"].map(value=>[value,value])}/><SelectField label="Address family" value={profile.ipFamily} onChange={(value)=>onChange({...profile,ipFamily:value as ConnectionProfile["ipFamily"]})} options={[["both","IPv4 + IPv6"],["v4","IPv4 only"],["v6","IPv6 only"]]}/></div><SettingRow name="Probe parallelism" value="Core resource profile" /><SettingRow name="Candidate budget" value="Core scan mode" /><div className="roadmap"><Radar /><div><strong>Ranked candidate list</strong><span>Scanning without connecting needs the engine linked in, not spawned.</span></div><Badge tone="roadmap">NEXT SLICE</Badge></div></article><article className="card"><div className="section-head"><div><span className="label">ACCEPTANCE</span><h3>Winner criteria</h3></div></div><NumberField label="Data-plane deadline" value={profile.validateSecs} min={1} max={120} unit="sec" onChange={(value)=>onChange({...profile,validateSecs:value})}/><ToggleField label="End-to-end data check" copy="Expose SOCKS only after a real tunneled request succeeds." checked={profile.dataCheck} onChange={(checked)=>onChange({...profile,dataCheck:checked})}/><SettingRow name="Cache policy" value={profile.quickReconnect?"Verify before reuse":"Always scan fresh"} /></article></div></>;
 }
 
 function Transports({ profile, onChange }: ProfileProps) {
@@ -264,8 +282,39 @@ function Identity({ profile, onChange }: ProfileProps) {
   return <><PageIntro badge="CORE TODAY" title="Zero Trust identity" copy="Enrollment settings are sent to Aether; secrets remain memory-only until OS-vault integration lands." /><div className="two-col"><article className="card"><div className="section-head"><div><span className="label">ORGANIZATION</span><h3>Cloudflare Zero Trust</h3></div></div><div className="form-grid two"><TextField label="Team" value={profile.team??""} placeholder="team name" onChange={(value)=>onChange({...profile,team:value||null})}/><TextField label="Email" value={profile.accessEmail??""} placeholder="you@example.com" onChange={(value)=>onChange({...profile,accessEmail:value||null})}/><TextField label="Access client ID" value={profile.accessClientId??""} onChange={(value)=>onChange({...profile,accessClientId:value||null})}/><TextField label="Access client secret" type="password" value={profile.accessClientSecret??""} onChange={(value)=>onChange({...profile,accessClientSecret:value||null})}/><TextField label="Existing token" type="password" value={profile.accessToken??""} onChange={(value)=>onChange({...profile,accessToken:value||null})}/></div></article><article className="card"><div className="section-head"><div><span className="label">GATEWAY</span><h3>Organization filtering</h3></div><Switch checked={profile.gateway} onCheckedChange={(checked)=>onChange({...profile,gateway:checked})}/></div><p className="warning">Gateway adds a hop and permits organization filtering and logging for web traffic.</p><ToggleField label="Send web traffic to Gateway" copy="Applies the enrolled organization policy." checked={profile.gateway} onChange={(checked)=>onChange({...profile,gateway:checked})}/><SettingRow name="Secret persistence" value="Disabled"/></article></div></>;
 }
 
-function Diagnostics({ snapshot, logs }: { snapshot: CoreSnapshot; logs: CoreLogEvent[] }) {
-  return <><PageIntro badge="LIVE LOCAL" title="Diagnostics" copy="Real process state and Aether output, capped at the latest 1,000 lines." /><div className="metric-grid"><Metric icon={Activity} value={stateName(snapshot.state)} label="Core status" note="LIVE"/><Metric icon={Route} value={transportName(snapshot.transport)} label="Current transport" note="CORE"/><Metric icon={Network} value={snapshot.pid?.toString()??"—"} label="Process ID" note="LOCAL"/><Metric icon={Clock3} value={snapshot.endpoint??"—"} label="Selected edge" note="CORE"/></div><article className="card log"><div className="section-head"><div><span className="label">EVENT STREAM</span><h3>Aether core log</h3></div><Badge tone="current">{logs.length} LINES</Badge></div><div className="log-lines">{logs.length ? logs.map((entry,index)=><div key={`${entry.timestamp}-${index}`}><time>{new Date(entry.timestamp).toLocaleTimeString()}</time><span className={entry.level}>{entry.level.toUpperCase()}</span><code>{entry.message}</code></div>) : <p>No core events yet. Start a connection to populate this stream.</p>}</div></article></>;
+function Diagnostics({ snapshot, logs, profile, probe, runtime, onSaved, onError }: { snapshot: CoreSnapshot; logs: CoreLogEvent[]; profile: ConnectionProfile; probe: CoreProbe; runtime: string; onSaved: (path: string) => void; onError: (error: unknown) => void }) {
+  const [includeSystem, setIncludeSystem] = useState(true);
+  const [includeSettings, setIncludeSettings] = useState(true);
+  const [includeEvents, setIncludeEvents] = useState(true);
+  const [redact, setRedact] = useState(true);
+  const report = useMemo(
+    () => buildReport({ appVersion, engineVersion: probe.version, system: runtime, snapshot, profile, logs, options: { includeSystem, includeSettings, includeEvents, redact } }),
+    [probe.version, runtime, snapshot, profile, logs, includeSystem, includeSettings, includeEvents, redact],
+  );
+
+  async function copyReport() {
+    try {
+      await navigator.clipboard.writeText(report);
+      onSaved("Report copied to the clipboard.");
+    } catch (error) { onError(error); }
+  }
+
+  async function writeReport() {
+    try { onSaved(await saveReport(report, reportFilename())); } catch (error) { onError(error); }
+  }
+
+  return <><PageIntro badge="LIVE LOCAL" title="Diagnostics" copy="Real process state and Aether output, capped at the latest 1,000 lines." /><div className="metric-grid"><Metric icon={Activity} value={stateName(snapshot.state)} label="Core status" note="LIVE"/><Metric icon={Route} value={transportName(snapshot.transport)} label="Current transport" note="CORE"/><Metric icon={Network} value={snapshot.pid?.toString()??"—"} label="Process ID" note="LOCAL"/><Metric icon={Clock3} value={snapshot.endpoint??"—"} label="Selected edge" note="CORE"/></div>
+    <article className="card log"><div className="section-head"><div><span className="label">EVENT STREAM</span><h3>Aether core log</h3></div><Badge tone="current">{logs.length} LINES</Badge></div><div className="log-lines">{logs.length ? logs.map((entry,index)=><div key={`${entry.timestamp}-${index}`}><time>{new Date(entry.timestamp).toLocaleTimeString()}</time><span className={entry.level}>{entry.level.toUpperCase()}</span><code>{entry.message}</code></div>) : <p>No core events yet. Start a connection to populate this stream.</p>}</div></article>
+    <article className="card"><div className="section-head"><div><span className="label">REPORT</span><h3>Share a problem</h3></div><Badge tone="current">{redact ? "REDACTED" : "VERBATIM"}</Badge></div>
+      <p className="field-help">Raise the log level under Connection Lab, reproduce the problem, then build the report. Nothing is sent anywhere — you get a file, and you choose where it goes.</p>
+      <ToggleField label="App and engine version" copy="Always included — a report without it cannot be read." checked onChange={()=>{}} disabled />
+      <ToggleField label="Operating system" copy={runtime} checked={includeSystem} onChange={setIncludeSystem} />
+      <ToggleField label="Connection settings" copy="No Zero Trust credentials and no pinned address — only whether one is set." checked={includeSettings} onChange={setIncludeSettings} />
+      <ToggleField label={`Recent events (up to ${REPORT_EVENT_LIMIT})`} copy="What the core and the supervisor did, most recent last." checked={includeEvents} onChange={setIncludeEvents} />
+      <ToggleField label="Replace IP addresses" copy="Swaps them for placeholders. Most problems can still be diagnosed." checked={redact} onChange={setRedact} />
+      <pre className="report-preview">{report}</pre>
+      <div className="report-actions"><Button variant="secondary" onClick={copyReport}><Copy />Copy report</Button><Button onClick={writeReport}><Save />Save report</Button></div>
+    </article></>;
 }
 
 function Preferences({ profile, onChange, probe, onProbe }: ProfileProps & { probe: CoreProbe; onProbe: () => void }) {
@@ -278,11 +327,11 @@ function Metric({ icon: Icon, value, label, note }: { icon: typeof Clock3; value
 function PathNode({ icon: Icon, label, active=false }: { icon: typeof Laptop; label: string; active?: boolean }) { return <div className={`path-node ${active?"active":""}`}><Icon /><small>{label}</small></div>; }
 function PageIntro({ badge, title, copy, action }: { badge: string; title: string; copy: string; action?: React.ReactNode }) { return <div className="page-intro"><div><Badge tone="current">{badge}</Badge><h2>{title}</h2><p>{copy}</p></div>{action}</div>; }
 function SettingRow({ name, value }: { name: string; value: string }) { return <div className="setting-row"><span>{name}</span><strong>{value}</strong></div>; }
-function SelectField({ label, value, options, onChange }: { label: string; value: string; options: string[][]; onChange: (value: string)=>void }) { return <label className="field">{label}<select value={value} onChange={(event)=>onChange(event.target.value)}>{options.map(([option,labelText])=><option value={option} key={option}>{labelText}</option>)}</select></label>; }
+function SelectField({ label, value, options, onChange, hint }: { label: string; value: string; options: string[][]; onChange: (value: string)=>void; hint?: string }) { return <label className="field">{label}<select value={value} onChange={(event)=>onChange(event.target.value)}>{options.map(([option,labelText])=><option value={option} key={option}>{labelText}</option>)}</select>{hint && <small className="field-help">{hint}</small>}</label>; }
 function TextField({ label, value, onChange, placeholder, type="text" }: { label: string; value: string; onChange: (value:string)=>void; placeholder?: string; type?: string }) { return <label className="field">{label}<input type={type} value={value} placeholder={placeholder} onChange={(event)=>onChange(event.target.value)}/></label>; }
 function NumberField({ label, value, onChange, min, max, unit }: { label:string; value:number; onChange:(value:number)=>void; min:number; max:number; unit:string }) { return <label className="field">{label}<span className="input-unit"><input type="number" value={value} min={min} max={max} onChange={(event)=>onChange(Number(event.target.value))}/><em>{unit}</em></span></label>; }
 function TextAreaField({ value, onChange, placeholder }: { value:string; onChange:(value:string)=>void; placeholder:string }) { return <textarea className="rules-area" value={value} onChange={(event)=>onChange(event.target.value)} placeholder={placeholder} rows={8}/>; }
-function ToggleField({ label, copy, checked, onChange }: { label:string; copy:string; checked:boolean; onChange:(checked:boolean)=>void }) { return <div className="toggle-row"><div><strong>{label}</strong><span>{copy}</span></div><Switch checked={checked} onCheckedChange={onChange}/></div>; }
+function ToggleField({ label, copy, checked, onChange, disabled=false }: { label:string; copy:string; checked:boolean; onChange:(checked:boolean)=>void; disabled?:boolean }) { return <div className="toggle-row"><div><strong>{label}</strong><span>{copy}</span></div><Switch checked={checked} disabled={disabled} onCheckedChange={onChange}/></div>; }
 function currentPhase(snapshot: CoreSnapshot, profile: ConnectionProfile): ConnectionPhase { if (snapshot.transport === "masque-h3") return "h3"; if (snapshot.transport === "wireguard" || snapshot.transport === "warp-in-warp") return "wg"; if (snapshot.transport === "masque-h2") return "h2"; return profile.protocol === "wg" || profile.protocol === "gool" ? "wg" : profile.masqueTransport; }
 function transportName(value: CoreSnapshot["transport"]): string { return ({"masque-h2":"MASQUE H2","masque-h3":"MASQUE H3","wireguard":"WireGuard","warp-in-warp":"WARP in WARP"} as Record<string,string>)[value??""]??"None"; }
 function stateName(value: CoreSnapshot["state"]): string { return ({idle:"Ready",starting:"Starting",scanning:"Scanning",connecting:"Validating",connected:"Connected",reconnecting:"Reconnecting",stopped:"Stopped",error:"Error"} as Record<string,string>)[value]; }

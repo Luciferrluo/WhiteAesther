@@ -76,7 +76,10 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 22
+          # 24 for the test runner: the unit tests are TypeScript, and Node only
+          # strips types without a flag from 22.18 onward. Pinning the major
+          # keeps that from depending on which 22.x the runner happens to have.
+          node-version: 24
           cache: pnpm
 
       - name: Install Rust
@@ -102,8 +105,11 @@ jobs:
           echo "VITE_APP_VERSION=${visible_version}" >> "$GITHUB_ENV"
           echo "WhiteAesther UI version: ${visible_version}"
 
-      - name: Compile and test the frontend
+      - name: Compile the frontend
         run: pnpm build
+
+      - name: Test the frontend
+        run: pnpm test
 
       - name: Compile the Aether core
         run: cargo build --release --locked --manifest-path aether-core/aether/Cargo.toml

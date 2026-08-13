@@ -113,6 +113,7 @@ pub fn run() {
             core_supervisor::core_logs,
             core_supervisor::save_profile,
             core_supervisor::load_profile,
+            core_supervisor::save_report,
         ])
         .run(tauri::generate_context!())
         .expect("error while running WhiteAesther");

@@ -14,12 +14,12 @@ export function buildCoreCommand(profile: ConnectionProfile): string {
     "--dns", profile.dns.join(","),
     "--noize", profile.noize,
     "--keepalive", String(profile.keepaliveSecs),
-    "--log-level", profile.logLevel,
+    "--log-level", processLogLevel(profile.logLevel),
     profile.dataCheck ? "" : "--no-data-check",
     profile.fragmentClientHello && profile.protocol === "masque" && profile.masqueTransport === "h2"
       ? `--fragment --fragment-size ${quote(profile.fragmentSize)} --fragment-delay ${quote(profile.fragmentDelay)}` : "",
     profile.profileRetry ? "" : "--no-profile-retry",
-    option("--peer", profile.peer),
+    profile.endpointMode === "automatic" ? "" : option("--peer", profile.peer),
     option("--wg-peer", profile.wgPeer),
     option("--h2-peer", profile.h2Peer),
     profile.ech && profile.ech !== "off" ? option("--ech", profile.ech) : "",
@@ -31,6 +31,15 @@ export function buildCoreCommand(profile: ConnectionProfile): string {
     profile.gateway ? "--gateway" : "",
   ].filter(Boolean);
   return `aether ${args.join(" ")}`;
+}
+
+/**
+ * Connection state, the selected edge and the latency are all read out of
+ * info-level core output, so the supervisor never runs the child below info.
+ * Extra verbosity is passed through.
+ */
+export function processLogLevel(level: ConnectionProfile["logLevel"]): string {
+  return level === "debug" || level === "trace" ? level : "info";
 }
 
 function option(name: string, value: string | null): string {
