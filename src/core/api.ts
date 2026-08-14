@@ -68,7 +68,7 @@ export async function subscribeCore(
   return () => { unlistenStatus(); unlistenLog(); };
 }
 
-export type TrayAction = "toggle-connection" | "open-diagnostics";
+export type TrayAction = "toggle-connection" | "open-diagnostics" | "restore-proxy";
 
 export async function subscribeTrayActions(onAction: (action: TrayAction) => void): Promise<UnlistenFn> {
   requireDesktop();

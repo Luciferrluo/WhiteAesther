@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { BadgeCheck, Search, Settings2 } from "lucide-react";
+import { BadgeCheck, Search, Settings2, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Advanced } from "@/features/Advanced";
@@ -169,12 +169,19 @@ export default function App() {
     void subscribeTrayActions((action) => {
       if (disposed) return;
       if (action === "open-diagnostics") setMode("advanced");
-      else void toggleRef.current();
+      else if (action === "restore-proxy") {
+        void stopCore()
+          .then((next) => {
+            setSnapshot(next);
+            notify("Connection restored", "Your system proxy has been put back.");
+          })
+          .catch(showError);
+      } else void toggleRef.current();
     })
       .then((cleanup) => { if (disposed) cleanup(); else unsubscribe = cleanup; })
       .catch(showError);
     return () => { disposed = true; unsubscribe?.(); };
-  }, [desktop, showError]);
+  }, [desktop, notify, showError]);
 
   const saveProfile = useCallback(async () => {
     try {
@@ -274,6 +281,34 @@ export default function App() {
           </Button>
         </div>
       </header>
+
+      {snapshot.blocking ? (
+        <div className="flex shrink-0 items-center gap-3 border-b border-warning/30 bg-warning/[0.09] px-[18px] py-2.5">
+          <ShieldAlert className="size-4 shrink-0 text-warning" />
+          <div className="min-w-0 flex-1">
+            <div className="text-[12.5px] font-semibold text-warning">Traffic is blocked, not broken</div>
+            <div className="truncate text-[11.5px] text-muted-foreground">
+              {snapshot.statusMessage ??
+                "The tunnel is down and your system proxy still points at it, so nothing leaves in the clear."}
+            </div>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            className="shrink-0"
+            onClick={async () => {
+              try {
+                setSnapshot(await stopCore());
+                notify("Connection restored", "Your system proxy has been put back.");
+              } catch (error) {
+                showError(error);
+              }
+            }}
+          >
+            Restore my connection
+          </Button>
+        </div>
+      ) : null}
 
       <main className="min-h-0 flex-1">
         {mode === "simple" ? (

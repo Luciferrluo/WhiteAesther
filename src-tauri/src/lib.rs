@@ -54,12 +54,22 @@ pub fn run() {
             )?;
             let diagnostics =
                 MenuItem::with_id(app, "diagnostics", "Open Diagnostics", true, None::<&str>)?;
+            // Reachable with the window hidden, which is exactly the state
+            // someone is in when the kill switch has blocked their traffic and
+            // they are looking for the way out.
+            let restore = MenuItem::with_id(
+                app,
+                "restore-proxy",
+                "Restore system proxy",
+                true,
+                None::<&str>,
+            )?;
             let hide = MenuItem::with_id(app, "hide", "Hide WhiteAesther", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
             let quit = MenuItem::with_id(app, "quit", "Quit WhiteAesther", true, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
-                &[&open, &connection, &diagnostics, &hide, &separator, &quit],
+                &[&open, &connection, &restore, &diagnostics, &hide, &separator, &quit],
             )?;
             let icon = app
                 .default_window_icon()
@@ -80,6 +90,9 @@ pub fn run() {
                     }
                     "toggle-connection" => {
                         let _ = app.emit("tray-action", "toggle-connection");
+                    }
+                    "restore-proxy" => {
+                        let _ = app.emit("tray-action", "restore-proxy");
                     }
                     "diagnostics" => {
                         show_main_window(app);

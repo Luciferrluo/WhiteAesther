@@ -70,6 +70,8 @@ export interface CoreSnapshot {
   statusMessage: string | null;
   attempt: number;
   maxAttempts: number;
+  /** The kill switch is holding traffic while the supervisor keeps searching. */
+  blocking: boolean;
 }
 
 export interface CoreLogEvent {
@@ -143,4 +145,5 @@ export const IDLE_SNAPSHOT: CoreSnapshot = {
   statusMessage: null,
   attempt: 0,
   maxAttempts: 8,
+  blocking: false,
 };

@@ -335,6 +335,9 @@ pub struct CoreSnapshot {
     /// 0 while the first launch is in flight, then the retry number.
     pub attempt: u32,
     pub max_attempts: u32,
+    /// The kill switch is holding traffic: the tunnel is down, the system proxy
+    /// still points at it, and the supervisor is retrying in the background.
+    pub blocking: bool,
 }
 
 impl Default for CoreSnapshot {
@@ -353,6 +356,7 @@ impl Default for CoreSnapshot {
             status_message: None,
             attempt: 0,
             max_attempts: MAX_ATTEMPTS,
+            blocking: false,
         }
     }
 }
@@ -685,6 +689,7 @@ fn launch(
             }),
             attempt,
             max_attempts: MAX_ATTEMPTS,
+            blocking: false,
         };
         emit_snapshot(app, &snapshot);
     }
@@ -970,6 +975,10 @@ fn spawn_exit_monitor(app: AppHandle, inner: Arc<SupervisorInner>, generation: u
 enum ExitDecision {
     Retry { attempt: u32, profile: CoreProfile },
     GiveUp { profile: CoreProfile },
+    /// Out of retries, but the kill switch is holding traffic. Ending the
+    /// session here would strand the machine behind a proxy nothing is
+    /// listening on, so the budget resets and the search keeps going.
+    Hold { profile: CoreProfile },
     /// The exit belongs to a session that has been superseded or stopped.
     Ignore,
 }
@@ -980,7 +989,7 @@ enum ExitDecision {
 /// session: a stop and a fresh start can both land between a core exiting and
 /// this running, and unconditionally clearing would throw away the new
 /// session's retry budget while leaving it connected.
-fn decide_exit(session: &mut Option<Session>, generation: u64) -> ExitDecision {
+fn decide_exit(session: &mut Option<Session>, generation: u64, holding: bool) -> ExitDecision {
     let Some(current) = session.as_mut() else {
         return ExitDecision::Ignore;
     };
@@ -994,6 +1003,14 @@ fn decide_exit(session: &mut Option<Session>, generation: u64) -> ExitDecision {
     // supervisor spends eight attempts and several minutes on a network the
     // person watching has already decided is not going to work.
     if attempt > MAX_ATTEMPTS || !profile.auto_reconnect {
+        // Unless traffic is being held. A kill switch that stops trying is a
+        // trap: it blocks the machine and then waits to be noticed. Reset the
+        // budget and keep searching on a slow loop instead, so the block lifts
+        // itself the moment a route comes back.
+        if holding {
+            current.attempt = 0;
+            return ExitDecision::Hold { profile };
+        }
         *session = None;
         return ExitDecision::GiveUp { profile };
     }
@@ -1067,10 +1084,18 @@ fn give_up(
 fn handle_exit(app: &AppHandle, inner: &Arc<SupervisorInner>, generation: u64, reason: String) {
     // Bound to its own statement so the session lock is released before
     // anything below reaches for another one.
-    let decision = decide_exit(&mut lock(&inner.session), generation);
+    // Read before taking the session lock, so the decision and the proxy state
+    // cannot be taken from two different moments.
+    let holding = {
+        let session = lock(&inner.session);
+        session.as_ref().is_some_and(|current| current.profile.kill_switch)
+            && inner.proxy_applied.load(Ordering::SeqCst)
+    };
+    let decision = decide_exit(&mut lock(&inner.session), generation, holding);
     let (attempt, base_profile) = match decision {
         ExitDecision::Ignore => return,
         ExitDecision::GiveUp { profile } => return give_up(app, inner, generation, &profile, reason),
+        ExitDecision::Hold { profile } => return hold(app, inner, generation, profile, reason),
         ExitDecision::Retry { attempt, profile } => (attempt, profile),
     };
 
@@ -1142,6 +1167,73 @@ fn handle_exit(app: &AppHandle, inner: &Arc<SupervisorInner>, generation: u64, r
             return;
         }
         if let Err(error) = launch(&app, &inner, &profile, attempt, generation) {
+            handle_exit(&app, &inner, generation, error);
+        }
+    });
+}
+
+/// How long to wait between attempts while traffic is being held.
+///
+/// Slower than the ordinary backoff on purpose: nothing is getting through, so
+/// there is no rush, and hammering a hostile network is what gets an address
+/// blocked rather than unblocked.
+const HOLD_RETRY: Duration = Duration::from_secs(30);
+
+/// Keeps the block in place and keeps looking for a way out.
+///
+/// The session survives, so the machine is never left behind a proxy with
+/// nothing behind it and nothing trying to fix that.
+fn hold(
+    app: &AppHandle,
+    inner: &Arc<SupervisorInner>,
+    generation: u64,
+    profile: CoreProfile,
+    reason: String,
+) {
+    {
+        let mut snapshot = lock(&inner.snapshot);
+        if !inner.is_current(generation) {
+            return;
+        }
+        snapshot.state = "error".into();
+        snapshot.pid = None;
+        snapshot.attempt = 0;
+        snapshot.blocking = true;
+        snapshot.status_message = Some(format!(
+            "Traffic is blocked while the tunnel is down · trying again every {}s",
+            HOLD_RETRY.as_secs()
+        ));
+        snapshot.last_error = Some(format!(
+            "{reason}. Traffic is being held rather than sent in the clear — the search continues \
+             in the background, or disconnect to put your system proxy back."
+        ));
+        emit_snapshot(app, &snapshot);
+    }
+    supervisor_log(
+        app,
+        inner,
+        "warn",
+        format!("{reason}; holding traffic and retrying every {}s", HOLD_RETRY.as_secs()),
+    );
+
+    let app = app.clone();
+    let inner = inner.clone();
+    thread::spawn(move || {
+        let deadline = Instant::now() + HOLD_RETRY;
+        while Instant::now() < deadline {
+            if !inner.is_current(generation) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        if !inner.is_current(generation) {
+            return;
+        }
+        // Attempt 1 rather than 0: the alternation in profile_for_attempt is what
+        // gets a blocked transport past a filter, and a hold that only ever tried
+        // the configured one would sit there forever.
+        let next = profile_for_attempt(&profile, 1);
+        if let Err(error) = launch(&app, &inner, &next, 1, generation) {
             handle_exit(&app, &inner, generation, error);
         }
     });
@@ -1323,6 +1415,16 @@ fn apply_system_proxy(app: &AppHandle, inner: &SupervisorInner, socks: &str) {
 /// a proxy left pointing at a listener that no longer exists takes the machine
 /// off the network.
 fn clear_system_proxy(app: &AppHandle, inner: &SupervisorInner) {
+    // Whatever else happens, the proxy is going back, so nothing is held any
+    // more. Cleared unconditionally: the flag must never outlive the block, or
+    // the screen tells the user they are protected when they are not.
+    {
+        let mut snapshot = lock(&inner.snapshot);
+        if snapshot.blocking {
+            snapshot.blocking = false;
+            emit_snapshot(app, &snapshot);
+        }
+    }
     if !inner.proxy_applied.swap(false, Ordering::SeqCst) {
         return;
     }
@@ -1384,6 +1486,8 @@ fn apply_log_to_snapshot(message: &str, snapshot: &mut CoreSnapshot) {
                 if candidate.parse::<SocketAddr>().is_ok() {
                     snapshot.socks_address = candidate.to_string();
                     snapshot.state = "connected".into();
+                    // A route is up, so nothing is being held any more.
+                    snapshot.blocking = false;
                 }
             }
             break;
@@ -1860,18 +1964,18 @@ mod tests {
     fn exits_count_up_to_the_limit_then_give_up() {
         let mut current = session(1, 0);
         for expected in 1..=MAX_ATTEMPTS {
-            match decide_exit(&mut current, 1) {
+            match decide_exit(&mut current, 1, false) {
                 ExitDecision::Retry { attempt, .. } => assert_eq!(attempt, expected),
                 other => panic!("attempt {expected} decided {other:?}"),
             }
         }
         assert!(matches!(
-            decide_exit(&mut current, 1),
+            decide_exit(&mut current, 1, false),
             ExitDecision::GiveUp { .. }
         ));
         // Giving up ends the session, so a later stray exit changes nothing.
         assert!(current.is_none());
-        assert!(matches!(decide_exit(&mut current, 1), ExitDecision::Ignore));
+        assert!(matches!(decide_exit(&mut current, 1, false), ExitDecision::Ignore));
     }
 
     #[test]
@@ -1881,12 +1985,67 @@ mod tests {
         // session -- clearing it would silently cost the new connection every
         // retry it is entitled to.
         let mut current = session(2, MAX_ATTEMPTS);
-        assert!(matches!(decide_exit(&mut current, 1), ExitDecision::Ignore));
+        assert!(matches!(decide_exit(&mut current, 1, false), ExitDecision::Ignore));
         assert_eq!(current.as_ref().unwrap().generation, 2);
         assert_eq!(current.as_ref().unwrap().attempt, MAX_ATTEMPTS);
 
         let mut stopped = None;
-        assert!(matches!(decide_exit(&mut stopped, 1), ExitDecision::Ignore));
+        assert!(matches!(decide_exit(&mut stopped, 1, false), ExitDecision::Ignore));
+    }
+
+    #[test]
+    fn a_held_block_never_ends_the_session() {
+        // The whole point of the hold: a kill switch that stops trying leaves
+        // the machine behind a proxy with nothing behind it, waiting to be
+        // noticed. Running out of attempts must reset the budget, not give up.
+        let mut current = session(1, MAX_ATTEMPTS);
+        assert!(matches!(
+            decide_exit(&mut current, 1, true),
+            ExitDecision::Hold { .. }
+        ));
+        assert!(current.is_some(), "holding must keep the session alive");
+        assert_eq!(
+            current.as_ref().unwrap().attempt,
+            0,
+            "the retry budget has to reset, or the next exit gives up anyway"
+        );
+
+        // And it keeps holding, rather than holding once and then stranding.
+        for _ in 0..(MAX_ATTEMPTS + 2) {
+            let decision = decide_exit(&mut current, 1, true);
+            assert!(
+                matches!(decision, ExitDecision::Retry { .. } | ExitDecision::Hold { .. }),
+                "a held session decided {decision:?}",
+            );
+            assert!(current.is_some());
+        }
+    }
+
+    #[test]
+    fn a_hold_stops_the_moment_traffic_is_no_longer_held() {
+        // Turning the kill switch off, or the proxy coming back, has to let the
+        // session end normally -- otherwise it retries forever in the background.
+        let mut current = session(1, MAX_ATTEMPTS);
+        assert!(matches!(
+            decide_exit(&mut current, 1, false),
+            ExitDecision::GiveUp { .. }
+        ));
+        assert!(current.is_none());
+    }
+
+    #[test]
+    fn declining_to_reconnect_still_holds_when_traffic_is_blocked() {
+        // "Keep me connected" off means do not chase a dead route. It cannot
+        // mean leave the machine blocked with nothing trying to unblock it.
+        let mut profile = CoreProfile::default();
+        profile.auto_reconnect = false;
+        profile.kill_switch = true;
+        let mut current = Some(Session { generation: 1, profile, attempt: 0 });
+        assert!(matches!(
+            decide_exit(&mut current, 1, true),
+            ExitDecision::Hold { .. }
+        ));
+        assert!(current.is_some());
     }
 
     fn pinned(mode: &str) -> CoreProfile {
