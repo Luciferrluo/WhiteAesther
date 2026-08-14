@@ -37,6 +37,10 @@ export function Scanner({ profile, snapshot, onPick, onToast }: ScannerProps) {
   }, []);
 
   const busy = phase === "scanning" || phase === "testing";
+  // The core's reporting modes wrap a MASQUE-only probe, so the picker under
+  // Routes has no effect here. Saying so beats letting someone select WireGuard
+  // and conclude the scanner is broken.
+  const masqueOnly = profile.protocol !== "masque";
   const connected = snapshot.state !== "idle" && snapshot.state !== "stopped" && snapshot.state !== "error";
   const pinned = normalizeEndpoint(profile.peer ?? "");
 
@@ -104,7 +108,8 @@ export function Scanner({ profile, snapshot, onPick, onToast }: ScannerProps) {
         <div className="flex flex-col gap-1.5">
           <CardTitle className="text-[15px]">Find a gateway</CardTitle>
           <CardDescription>
-            Tests real gateways and ranks them by round-trip time. Nothing is connected until you pick one.
+            Tests real MASQUE gateways over {label(profile.masqueTransport)} and ranks them by round-trip
+            time. Nothing is connected until you pick one.
           </CardDescription>
         </div>
         <div className="flex shrink-0 gap-2">
@@ -132,6 +137,17 @@ export function Scanner({ profile, snapshot, onPick, onToast }: ScannerProps) {
       </CardHeader>
 
       <CardContent className="pt-0">
+        {masqueOnly ? (
+          <p className="py-2 text-[13px] text-muted-foreground">
+            Your protocol is set to{" "}
+            <span className="font-medium text-foreground">
+              {profile.protocol === "wg" ? "WireGuard" : "WARP in WARP"}
+            </span>
+            . This searches for MASQUE gateways only, so anything found here applies when you switch back to
+            MASQUE — it will not change how {profile.protocol === "wg" ? "WireGuard" : "WARP in WARP"} connects.
+          </p>
+        ) : null}
+
         {connected ? (
           <p className="py-2 text-[13px] text-muted-foreground">
             Disconnect first — scanning while connected competes with the tunnel for the same gateways and
