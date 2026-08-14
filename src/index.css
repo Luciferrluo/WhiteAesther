@@ -153,12 +153,22 @@
     animation: orb-ripple 3.4s linear infinite;
   }
 
+  /* Someone who asks for less motion wants the decoration gone, not the only
+     sign that the app is doing something. Turning all of it off made a working
+     app look frozen -- and Windows ships this setting off for plenty of people,
+     so it was the ordinary experience rather than an edge case.
+     The glow, the expanding waves and the drifting ring are decoration and stop.
+     The sweep is the loading indicator and keeps going, slower, so it reads as
+     calm rather than busy. */
   @media (prefers-reduced-motion: reduce) {
-    .orb-sweep,
     .orb-orbit,
     .orb-bloom,
     .orb-ripple {
       animation: none;
+    }
+
+    .orb-sweep {
+      animation-duration: 2.4s;
     }
   }
 }
