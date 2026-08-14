@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Activity, FileText, Globe, Route as RouteIcon, ShieldCheck, Wifi, type LucideIcon,
 } from "lucide-react";
@@ -52,10 +52,21 @@ export interface AdvancedProps {
   appVersion: string;
   onSave: () => void;
   onToast: (title: string, message: string, error?: boolean) => void;
+  /**
+   * Set by settings search. Carries a nonce as well as the section, because
+   * searching for the same setting twice has to move there both times, and an
+   * effect keyed on the section alone would only fire the first time.
+   */
+  jumpTo?: { section: SectionId; at: number } | null;
 }
 
 export function Advanced(props: AdvancedProps) {
   const [section, setSection] = useState<SectionId>("status");
+
+  const { jumpTo } = props;
+  useEffect(() => {
+    if (jumpTo) setSection(jumpTo.section);
+  }, [jumpTo]);
   const heading = SECTIONS.flatMap((group) => group.items).find((item) => item.id === section);
 
   return (
@@ -460,6 +471,21 @@ function Traffic({ profile, onChange, runtime }: AdvancedProps) {
         <CardContent className="pt-0">
           <Row first title="Set the system proxy while connected" help={systemProxyHelp(runtime)}>
             <Switch checked={profile.systemProxy} onCheckedChange={(systemProxy) => set({ systemProxy })} />
+          </Row>
+          <Row
+            title="Keep me connected"
+            help="Search again when a route drops. Off, a dead session stays dead, which is what you want while testing a network."
+          >
+            <Switch
+              checked={profile.autoReconnect}
+              onCheckedChange={(autoReconnect) => set({ autoReconnect })}
+            />
+          </Row>
+          <Row
+            title="Block traffic if the tunnel drops"
+            help="Applications fail rather than send traffic in the clear. Until a route comes back or you disconnect, this machine has no working proxy."
+          >
+            <Switch checked={profile.killSwitch} onCheckedChange={(killSwitch) => set({ killSwitch })} />
           </Row>
           <p className="pb-1 text-[13px] text-muted-foreground">
             Put back on disconnect. If the app is killed rather than closed, the next launch restores it.

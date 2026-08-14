@@ -6,6 +6,8 @@ import { Advanced } from "@/features/Advanced";
 import { Simple } from "@/features/Simple";
 import { type CarryMode, carryFromProfile } from "@/features/carry";
 import { SAMPLE_MS, type Sample, append } from "@/features/latency";
+import { CommandPalette } from "@/features/CommandPalette";
+import type { SectionId } from "@/features/settingsIndex";
 import logo from "@/assets/logo.png";
 import {
   getCoreLogs, getCoreStatus, isDesktopRuntime, loadProfile, probeCore, probeLatency, runtimeInfo,
@@ -41,6 +43,8 @@ export default function App() {
   const [runtime, setRuntime] = useState("Desktop shell");
   const [toast, setToast] = useState<Toast | null>(null);
   const [latency, setLatency] = useState<Sample[]>([]);
+  const [palette, setPalette] = useState(false);
+  const [jumpTo, setJumpTo] = useState<{ section: SectionId; at: number } | null>(null);
 
   const desktop = isDesktopRuntime();
   const effective = useMemo(() => withNormalizedEndpoint(profile), [profile]);
@@ -158,7 +162,7 @@ export default function App() {
       }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
-        setMode("advanced");
+        setPalette(true);
       }
     }
     window.addEventListener("keydown", onKey);
@@ -262,7 +266,7 @@ export default function App() {
         <div className="flex items-center gap-2.5">
           <button
             type="button"
-            onClick={() => setMode("advanced")}
+            onClick={() => setPalette(true)}
             className="flex h-8 items-center gap-1.5 rounded-lg border bg-muted px-2.5 text-[12px]
               text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none
               focus-visible:ring-2 focus-visible:ring-ring"
@@ -340,9 +344,19 @@ export default function App() {
             appVersion={appVersion}
             onSave={() => void saveProfile()}
             onToast={notify}
+            jumpTo={jumpTo}
           />
         )}
       </main>
+
+      <CommandPalette
+        open={palette}
+        onClose={() => setPalette(false)}
+        onPick={(section) => {
+          setMode("advanced");
+          setJumpTo({ section, at: Date.now() });
+        }}
+      />
 
       <Credits engineVersion={probe.version} />
 
