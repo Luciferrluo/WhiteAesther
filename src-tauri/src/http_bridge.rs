@@ -113,7 +113,7 @@ fn serve(mut client: TcpStream, socks: SocketAddr) -> io::Result<()> {
         let Some((host, port)) = split_authority(&target, 443) else {
             return respond(&mut client, 400, "Bad Request");
         };
-        let upstream = match socks5_connect(socks, &host, port) {
+        let upstream = match socks5_connect(socks, &host, port, HANDSHAKE_TIMEOUT) {
             Ok(upstream) => upstream,
             Err(_) => return respond(&mut client, 502, "Bad Gateway"),
         };
@@ -128,7 +128,7 @@ fn serve(mut client: TcpStream, socks: SocketAddr) -> io::Result<()> {
     let Some((host, port, path)) = split_absolute_uri(&target) else {
         return respond(&mut client, 400, "Bad Request");
     };
-    let mut upstream = match socks5_connect(socks, &host, port) {
+    let mut upstream = match socks5_connect(socks, &host, port, HANDSHAKE_TIMEOUT) {
         Ok(upstream) => upstream,
         Err(_) => return respond(&mut client, 502, "Bad Gateway"),
     };
@@ -202,9 +202,20 @@ fn split_absolute_uri(target: &str) -> Option<(String, u16, String)> {
 ///
 /// The name is passed through as a domain rather than resolved here, so DNS
 /// happens inside the tunnel instead of leaking to the local resolver.
-fn socks5_connect(socks: SocketAddr, host: &str, port: u16) -> io::Result<TcpStream> {
-    let mut upstream = TcpStream::connect_timeout(&socks, HANDSHAKE_TIMEOUT)?;
-    upstream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+/// Opens a tunnelled connection through the SOCKS5 listener.
+///
+/// `timeout` bounds the connect and every read of the handshake. The bridge
+/// gives it a generous value because a browser is waiting on the far side; the
+/// latency probe gives it a short one, because a sample that has not landed is
+/// worth less than the next sample.
+pub(crate) fn socks5_connect(
+    socks: SocketAddr,
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let mut upstream = TcpStream::connect_timeout(&socks, timeout)?;
+    upstream.set_read_timeout(Some(timeout))?;
     upstream.set_nodelay(true)?;
 
     // Greeting: SOCKS5, one method, "no authentication".

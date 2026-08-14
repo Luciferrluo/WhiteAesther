@@ -107,6 +107,29 @@ export async function cancelScan(): Promise<boolean> {
 }
 
 /**
+ * Times one round trip through the live tunnel, in milliseconds.
+ *
+ * Null means there was nothing to measure — no tunnel, or a probe that did not
+ * come back. Both are ordinary while a route is settling.
+ */
+export async function probeLatency(): Promise<number | null> {
+  requireDesktop();
+  return invoke("probe_latency");
+}
+
+export interface SpeedResult {
+  mbps: number;
+  bytes: number;
+  seconds: number;
+}
+
+/** Downloads a fixed payload through the tunnel and reports the throughput. */
+export async function speedTest(): Promise<SpeedResult> {
+  requireDesktop();
+  return invoke("speed_test");
+}
+
+/**
  * Applies or removes the system proxy on a connection that is already up.
  * Returns whether it is now applied.
  */

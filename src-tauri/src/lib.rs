@@ -1,5 +1,6 @@
 mod core_supervisor;
 mod http_bridge;
+mod latency;
 mod scanner;
 mod system_proxy;
 
@@ -131,6 +132,8 @@ pub fn run() {
             scanner::scan_endpoints,
             scanner::test_endpoint,
             scanner::cancel_scan,
+            latency::probe_latency,
+            latency::speed_test,
         ])
         .build(tauri::generate_context!())
         .expect("error while running WhiteAesther")

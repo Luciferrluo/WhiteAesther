@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { BadgeCheck, Settings2, Shield } from "lucide-react";
+import { BadgeCheck, Search, Settings2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Advanced } from "@/features/Advanced";
 import { Simple } from "@/features/Simple";
 import { type CarryMode, carryFromProfile } from "@/features/carry";
+import { SAMPLE_MS, type Sample, append } from "@/features/latency";
+import logo from "@/assets/logo.png";
 import {
-  getCoreLogs, getCoreStatus, isDesktopRuntime, loadProfile, probeCore, runtimeInfo,
+  getCoreLogs, getCoreStatus, isDesktopRuntime, loadProfile, probeCore, probeLatency, runtimeInfo,
   saveProfile as persistProfile, setSystemProxy, startCore, stopCore, subscribeCore,
   subscribeTrayActions,
 } from "@/core/api";
@@ -35,9 +37,9 @@ export default function App() {
   const [logs, setLogs] = useState<CoreLogEvent[]>([]);
   const [runtime, setRuntime] = useState("Desktop shell");
   const [toast, setToast] = useState<Toast | null>(null);
+  const [latency, setLatency] = useState<Sample[]>([]);
 
   const desktop = isDesktopRuntime();
-  const running = ACTIVE.has(snapshot.state);
   const effective = useMemo(() => withNormalizedEndpoint(profile), [profile]);
 
   const notify = useCallback((title: string, message: string, error?: boolean) => {
@@ -91,6 +93,36 @@ export default function App() {
     return () => window.clearTimeout(timeout);
   }, [toast]);
 
+  // The round-trip series behind the status chart. Only runs while a tunnel is
+  // up, and the history is thrown away on disconnect: samples from the previous
+  // route say nothing about the next one.
+  useEffect(() => {
+    if (!desktop || snapshot.state !== "connected") {
+      setLatency([]);
+      return;
+    }
+    let disposed = false;
+    let timer = 0;
+
+    const sample = async () => {
+      try {
+        const value = await probeLatency();
+        if (!disposed) setLatency((history) => append(history, value));
+      } catch {
+        // A probe that throws is a probe that failed; the gap in the chart says
+        // so, and a toast for every five seconds of a bad route would be noise.
+        if (!disposed) setLatency((history) => append(history, null));
+      }
+      if (!disposed) timer = window.setTimeout(() => void sample(), SAMPLE_MS);
+    };
+    void sample();
+
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+    };
+  }, [desktop, snapshot.state]);
+
   const toggleConnection = useCallback(async () => {
     try {
       if (ACTIVE.has(snapshot.state)) {
@@ -120,6 +152,10 @@ export default function App() {
       if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
         event.preventDefault();
         void toggleRef.current();
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setMode("advanced");
       }
     }
     window.addEventListener("keydown", onKey);
@@ -158,6 +194,24 @@ export default function App() {
     }
   }, [desktop, profile, effective, notify, showError]);
 
+  /**
+   * A switch flipped on the Simple screen has to survive the session, so this
+   * writes through to disk rather than only to state. The supervisor reads the
+   * live session's copy, so both halves are kept in step.
+   */
+  const applyProfile = useCallback(
+    (patch: Partial<ConnectionProfile>) => {
+      setProfile((current) => {
+        const next = { ...current, ...patch };
+        if (desktop) {
+          void persistProfile(withNormalizedEndpoint(next)).catch(showError);
+        }
+        return next;
+      });
+    },
+    [desktop, showError],
+  );
+
   const carry: CarryMode = carryFromProfile(profile.systemProxy);
   const setCarry = useCallback(
     (next: CarryMode) => {
@@ -189,15 +243,26 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col bg-background">
-      <header className="flex h-[52px] shrink-0 items-center justify-between border-b bg-card px-5">
+      <header className="flex h-[56px] shrink-0 items-center justify-between border-b bg-[linear-gradient(180deg,hsl(var(--card-top)),hsl(var(--card)))] px-[18px] shadow-[inset_0_1px_0_hsl(0_0%_100%/0.03)]">
         <div className="flex items-center gap-2.5">
-          <span className="grid size-[26px] place-items-center rounded-[7px] bg-primary text-primary-foreground">
-            <Shield className="size-[15px]" />
-          </span>
-          <span className="text-sm font-semibold tracking-tight">WhiteAesther</span>
-          {running ? <span className="ml-1 size-1.5 rounded-full bg-primary" aria-hidden /> : null}
+          <img src={logo} alt="" className="size-[26px] rounded-[7px]" />
+          <span className="text-[14.5px] font-semibold tracking-tight">WhiteAesther</span>
+          <StateChip snapshot={snapshot} />
         </div>
         <div className="flex items-center gap-2.5">
+          <button
+            type="button"
+            onClick={() => setMode("advanced")}
+            className="flex h-8 items-center gap-1.5 rounded-lg border bg-muted px-2.5 text-[12px]
+              text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none
+              focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <Search className="size-[13px]" />
+            <span>Search settings</span>
+            <kbd className="rounded border bg-secondary px-1.5 py-0.5 text-[10px] font-semibold text-foreground">
+              Ctrl K
+            </kbd>
+          </button>
           <Tabs value={mode} onValueChange={(value) => setMode(value as Mode)}>
             <TabsList className="h-8">
               <TabsTrigger value="simple" className="px-3 py-1 text-[13px]">Simple</TabsTrigger>
@@ -217,11 +282,14 @@ export default function App() {
             profile={profile}
             probe={probe}
             carry={carry}
+            latency={latency}
             onCarry={setCarry}
             onToggle={() => void toggleConnection()}
             onAdvanced={() => setMode("advanced")}
             onRetryStealth={() => void retryStealth()}
             onReport={() => setMode("advanced")}
+            onProfile={applyProfile}
+            onToast={notify}
           />
         ) : (
           <Advanced
@@ -237,6 +305,8 @@ export default function App() {
           />
         )}
       </main>
+
+      <Credits engineVersion={probe.version} />
 
       {toast ? (
         <div
@@ -255,4 +325,65 @@ export default function App() {
       ) : null}
     </div>
   );
+}
+
+function StateChip({ snapshot }: { snapshot: CoreSnapshot }) {
+  if (snapshot.state === "connected")
+    return (
+      <span className="ml-1.5 inline-flex h-[22px] items-center gap-1.5 rounded-full border border-primary/30 bg-primary/[0.13] px-2.5 text-[11.5px] font-semibold text-primary">
+        <span className="size-1.5 rounded-full bg-current" />
+        Connected
+      </span>
+    );
+  if (snapshot.state === "error")
+    return (
+      <span className="ml-1.5 inline-flex h-[22px] items-center gap-1.5 rounded-full border border-destructive/40 bg-destructive/10 px-2.5 text-[11.5px] font-semibold text-destructive">
+        <span className="size-1.5 rounded-full bg-current" />
+        Stopped
+      </span>
+    );
+  if (!ACTIVE.has(snapshot.state))
+    return (
+      <span className="ml-1.5 inline-flex h-[22px] items-center gap-1.5 rounded-full border bg-muted px-2.5 text-[11.5px] font-semibold text-muted-foreground">
+        <span className="size-1.5 rounded-full bg-current" />
+        Not connected
+      </span>
+    );
+  return (
+    <span className="ml-1.5 inline-flex h-[22px] items-center gap-1.5 rounded-full border border-warning/30 bg-warning/[0.13] px-2.5 text-[11.5px] font-semibold text-warning">
+      <span className="size-1.5 animate-pulse rounded-full bg-current" />
+      {snapshot.attempt > 0 ? `Searching · ${snapshot.attempt} of ${snapshot.maxAttempts}` : "Searching"}
+    </span>
+  );
+}
+
+/**
+ * Version, engine build, licence and source — the same facts the Android client
+ * puts on its About screen. AGPL-3.0 obliges us to tell people where the source
+ * for the build they are running lives, so this is not decoration.
+ */
+function Credits({ engineVersion }: { engineVersion: string | null }) {
+  return (
+    <footer className="flex h-[34px] shrink-0 items-center justify-between border-t bg-sidebar-foot px-[18px] text-[11.5px] text-muted-foreground">
+      <div className="flex min-w-0 items-center gap-2.5">
+        <img src={logo} alt="" className="size-3.5 rounded opacity-85" />
+        <span>
+          WhiteAesther <b className="font-semibold text-foreground/70">{appVersion}</b>
+        </span>
+        <Rule />
+        <span className="truncate">
+          engine <span className="tabular font-mono">{engineVersion ?? "unavailable"}</span>
+        </span>
+        <Rule />
+        <span>AGPL-3.0</span>
+        <Rule />
+        <span className="truncate font-mono">github.com/WhiteDNS/WhiteAesther</span>
+      </div>
+      <span className="shrink-0">Built on the Aether engine</span>
+    </footer>
+  );
+}
+
+function Rule() {
+  return <span className="text-border-strong">|</span>;
 }

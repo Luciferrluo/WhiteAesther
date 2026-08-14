@@ -73,6 +73,16 @@ pub struct CoreProfile {
     /// Point the operating system's proxy settings at the SOCKS5 listener while
     /// connected, and put them back on disconnect.
     pub system_proxy: bool,
+    /// Keep trying after a route drops. Off, a session that dies is left dead
+    /// rather than retried, which is what someone debugging a network wants.
+    pub auto_reconnect: bool,
+    /// Leave the system proxy pointed at the dead listener when the tunnel
+    /// fails, so applications that follow it fail rather than send the traffic
+    /// in the clear.
+    ///
+    /// The cost is real: until the tunnel comes back or the app is closed, the
+    /// machine has no working proxy. Off by default for that reason.
+    pub kill_switch: bool,
 }
 
 impl Default for CoreProfile {
@@ -98,6 +108,8 @@ impl Default for CoreProfile {
             tls_groups: None,
             performance_profile: "auto".into(),
             keepalive_secs: 5,
+            auto_reconnect: true,
+            kill_switch: false,
             noize: "balanced".into(),
             profile_retry: true,
             log_level: "info".into(),
@@ -415,6 +427,16 @@ impl CoreSupervisor {
                 bridge: Mutex::new(None),
             }),
         }
+    }
+
+    /// The listener to measure through, or `None` when nothing is connected.
+    ///
+    /// Deliberately narrow: the latency probe needs one string and no more, and
+    /// handing it the whole snapshot would let it read state it has no business
+    /// acting on.
+    pub fn connected_socks(&self) -> Option<String> {
+        let snapshot = lock(&self.inner.snapshot);
+        (snapshot.state == "connected").then(|| snapshot.socks_address.clone())
     }
 
     /// Refuses when a connection is live: a scan competes with it for the same
@@ -968,7 +990,10 @@ fn decide_exit(session: &mut Option<Session>, generation: u64) -> ExitDecision {
     current.attempt += 1;
     let attempt = current.attempt;
     let profile = current.profile.clone();
-    if attempt > MAX_ATTEMPTS {
+    // Asked not to retry, the first death is the last one. Without this the
+    // supervisor spends eight attempts and several minutes on a network the
+    // person watching has already decided is not going to work.
+    if attempt > MAX_ATTEMPTS || !profile.auto_reconnect {
         *session = None;
         return ExitDecision::GiveUp { profile };
     }
@@ -984,7 +1009,9 @@ fn give_up(
 ) {
     // Every attempt went to the same pinned address, so naming it is more use
     // than repeating the core's last error.
-    let summary = if profile.endpoint_mode == "custom-only" {
+    let summary = if !profile.auto_reconnect {
+        format!("{reason}. Not retried, because \"keep me connected\" is off.")
+    } else if profile.endpoint_mode == "custom-only" {
         format!(
             "The pinned endpoint {} never answered. Stopped after {MAX_ATTEMPTS} attempts — switch \
              Endpoint back to Automatic to search instead.",
@@ -1013,6 +1040,22 @@ fn give_up(
         "error",
         format!("gave up after {MAX_ATTEMPTS} attempts: {reason}"),
     );
+
+    // The kill switch only bites here, on the failure path. An explicit stop and
+    // a quit both restore unconditionally, so the machine can always be put back
+    // by disconnecting or closing the app — and a kill rather than a close is
+    // caught by the recovery pass at the next launch.
+    if profile.kill_switch && inner.proxy_applied.load(Ordering::SeqCst) {
+        supervisor_log(
+            app,
+            inner,
+            "warn",
+            "the tunnel is down and the system proxy has been left pointing at it, so traffic \
+             fails instead of leaving in the clear. Disconnect to put it back."
+                .into(),
+        );
+        return;
+    }
     clear_system_proxy(app, inner);
 }
 
