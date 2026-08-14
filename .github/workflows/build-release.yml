@@ -7,9 +7,11 @@ name: build, test and release
 on:
   pull_request:
   push:
-    # Tags only. A merge to main is the same tree a pull request just built and
-    # passed, so building it again bought nothing and cost a full three-platform
-    # run on every merge.
+    # Merging a version bump is what publishes. Requiring a tag afterwards left
+    # a gap where the work was merged but not released, and the tag then started
+    # a second full build of a tree that had just been built -- so the release
+    # was always one more errand and one more wait after it looked finished.
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -26,8 +28,49 @@ env:
   AETHER_REVISION: v1.5.0-whiteaesther.3
 
 jobs:
+  gate:
+    name: Decide whether this publishes
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+      version: ${{ steps.decide.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Seconds, not minutes. A merge that does not change the version does no
+      # building at all, so ordinary merges stay free.
+      - id: decide
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+          publish=false
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            publish=true
+          elif [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            # The released versions are the record of what has shipped, so the
+            # question "is this new" needs no extra state to answer.
+            if gh release view "v${version}" >/dev/null 2>&1; then
+              echo "v${version} is already released; this merge changes nothing to publish"
+            else
+              publish=true
+            fi
+          fi
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          echo "version ${version}, publish ${publish}"
+
   package:
     name: ${{ matrix.name }}
+    needs: gate
+    # Pull requests always build: bundling is where packaging problems show up,
+    # and the missing xdg-open on arm64 would otherwise have surfaced during a
+    # release instead of before one.
+    if: >-
+      github.event_name != 'push' || needs.gate.outputs.publish == 'true'
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -123,7 +166,10 @@ jobs:
           base_version="$(node -p "require('./package.json').version")"
           short_sha="${GITHUB_SHA:0:7}"
 
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          # Anything being published shows the plain version. Anything else is
+          # marked as the branch build it is, so a test build can never be
+          # mistaken for a release in a bug report.
+          if [[ "${{ needs.gate.outputs.publish }}" == "true" ]]; then
             visible_version="${base_version}"
           else
             branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
@@ -162,11 +208,10 @@ jobs:
 
   release:
     name: Publish GitHub release
-    needs: package
-    # A version tag is now the only thing that publishes. workflow_dispatch still
-    # builds and uploads artifacts, so a manual check of the packages does not
-    # have to create a release to get them.
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [gate, package]
+    # workflow_dispatch still builds and uploads artifacts, so the packages can
+    # be checked by hand without creating a release.
+    if: needs.gate.outputs.publish == 'true' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -180,6 +225,17 @@ jobs:
       - name: Flatten package directories
         shell: bash
         run: |
+          set -euo pipefail
+
+          # Counted rather than asserted against a fixed number. A hardcoded
+          # total has to be remembered every time the build matrix changes, and
+          # the one thing that actually matters here is that flattening did not
+          # let two packages with the same name overwrite each other. Comparing
+          # before with after checks exactly that, and keeps checking it however
+          # many architectures are added later.
+          before="$(find release-assets -type f | wc -l)"
+          test "${before}" -gt 0 || { echo "no packages were built" >&2; exit 1; }
+
           mkdir flattened-assets
           while IFS= read -r -d '' package; do
             cp -- "$package" "flattened-assets/$(basename "$package")"
@@ -187,21 +243,20 @@ jobs:
           rm -rf release-assets
           mv flattened-assets release-assets
 
-          # 2 Windows (exe, msi) + 2 macOS (a dmg each) + 3 Linux x86_64
-          # (deb, rpm, AppImage) + 3 Linux arm64 = 10.
-          #
-          # Flattening means two packages with the same name would silently
-          # overwrite each other, so this count is also the check that every
-          # architecture produced a distinctly named installer. Update it when
-          # the matrix changes.
-          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 10
+          after="$(find release-assets -maxdepth 1 -type f | wc -l)"
+          if [ "${before}" -ne "${after}" ]; then
+            echo "${before} packages went in and ${after} came out: two of them share a name" >&2
+            exit 1
+          fi
+          echo "${after} packages"
 
       - name: Give every package the same naming scheme
         shell: bash
         run: |
           set -euo pipefail
           cd release-assets
-          version="${GITHUB_REF_NAME#v}"
+          expected="$(find . -maxdepth 1 -type f | wc -l)"
+          version="${{ needs.gate.outputs.version }}"
 
           # Each bundler names the same machine differently: x64, amd64 and
           # x86_64 are one architecture, aarch64 and arm64 are another. Someone
@@ -231,9 +286,14 @@ jobs:
             mv -- "$asset" "WhiteAesther_${version}_${named}"
           done
 
-          # Renaming collapses names, so two packages could now collide where
-          # they did not before. Ten in, ten out.
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 10
+          # Renaming collapses names, so two packages could collide here even
+          # though they did not before. Same check, same reasoning, no total to
+          # keep up to date.
+          renamed="$(find . -maxdepth 1 -type f | wc -l)"
+          if [ "${renamed}" -ne "${expected}" ]; then
+            echo "renaming turned ${expected} packages into ${renamed}" >&2
+            exit 1
+          fi
           echo "Published assets:"
           ls -1
 
@@ -247,7 +307,7 @@ jobs:
             | sort -z \
             | xargs -0 sha256sum > SHA256SUMS
 
-      - name: Publish the tagged release
+      - name: Publish the release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -255,12 +315,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          tag="${GITHUB_REF_NAME}"
+          tag="v${{ needs.gate.outputs.version }}"
+
+          # --target creates the tag at this commit when it does not exist yet,
+          # which is what makes merging the release: no separate tag to push
+          # afterwards, and so no window where the work is merged but the
+          # release is still missing.
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" release-assets/* --clobber
           else
             gh release create "$tag" release-assets/* \
-              --verify-tag \
+              --target "${GITHUB_SHA}" \
               --generate-notes \
               --title "WhiteAesther $tag"
           fi
+          echo "Released $tag from ${GITHUB_SHA}"
+          gh release view "$tag" --json url --jq .url
