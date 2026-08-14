@@ -31,11 +31,21 @@ jobs:
   gate:
     name: Decide whether this publishes
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Reads the workflow history to find the run that already built this
+      # source. The workflow-wide default is contents-only, which would fail.
+      actions: read
     outputs:
       publish: ${{ steps.decide.outputs.publish }}
       version: ${{ steps.decide.outputs.version }}
+      reuse: ${{ steps.decide.outputs.reuse }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Both parents of the merge commit, so the tree that was tested can be
+          # compared with the tree being released.
+          fetch-depth: 0
 
       # Seconds, not minutes. A merge that does not change the version does no
       # building at all, so ordinary merges stay free.
@@ -61,16 +71,46 @@ jobs:
             fi
           fi
           echo "publish=${publish}" >> "$GITHUB_OUTPUT"
-          echo "version ${version}, publish ${publish}"
+
+          # The pull request that just merged already built every installer for
+          # this exact source. Rebuilding them on merge produced identical files
+          # and cost another full matrix -- the same work, twice, every release.
+          #
+          # Only reused when the merged tree is byte-identical to the tree that
+          # was built and tested. If main moved underneath the branch, the merge
+          # is code nobody has built, and it gets built.
+          reuse=""
+          if [[ "${publish}" == "true" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            if tested="$(git rev-parse -q --verify HEAD^2)"; then
+              if git diff --quiet "${tested}" HEAD; then
+                found="$(gh run list --workflow "${GITHUB_WORKFLOW}" --event pull_request \
+                          --status success --limit 40 \
+                          --json databaseId,headSha \
+                          --jq "[.[] | select(.headSha == \"${tested}\")][0].databaseId")"
+                if [[ -n "${found}" && "${found}" != "null" ]]; then
+                  reuse="${found}"
+                  echo "reusing the packages built and tested in run ${found}"
+                else
+                  echo "no successful pull request run found for ${tested}; building"
+                fi
+              else
+                echo "the merged tree differs from the tree that was tested; building"
+              fi
+            fi
+          fi
+          echo "reuse=${reuse}" >> "$GITHUB_OUTPUT"
+          echo "version ${version}, publish ${publish}, reuse ${reuse:-none}"
 
   package:
     name: ${{ matrix.name }}
     needs: gate
     # Pull requests always build: bundling is where packaging problems show up,
     # and the missing xdg-open on arm64 would otherwise have surfaced during a
-    # release instead of before one.
+    # release instead of before one. A merge skips it entirely when the gate
+    # found the run that already built this exact source.
     if: >-
-      github.event_name != 'push' || needs.gate.outputs.publish == 'true'
+      (github.event_name != 'push' || needs.gate.outputs.publish == 'true')
+      && needs.gate.outputs.reuse == ''
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -163,19 +203,11 @@ jobs:
       - name: Set the visible build version
         shell: bash
         run: |
-          base_version="$(node -p "require('./package.json').version")"
-          short_sha="${GITHUB_SHA:0:7}"
-
-          # Anything being published shows the plain version. Anything else is
-          # marked as the branch build it is, so a test build can never be
-          # mistaken for a release in a bug report.
-          if [[ "${{ needs.gate.outputs.publish }}" == "true" ]]; then
-            visible_version="${base_version}"
-          else
-            branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
-            branch="$(printf '%s' "$branch" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^0-9a-z]+/-/g; s/^-+|-+$//g')"
-            visible_version="${base_version}-${branch}.${GITHUB_RUN_NUMBER}+${short_sha}"
-          fi
+          # The plain version, always. Stamping branch builds with a different
+          # string was the only reason a release could not simply publish the
+          # packages the pull request had already built and tested -- it forced
+          # an identical rebuild purely so the footer would read differently.
+          visible_version="$(node -p "require('./package.json').version")"
 
           echo "VITE_APP_VERSION=${visible_version}" >> "$GITHUB_ENV"
           echo "WhiteAesther UI version: ${visible_version}"
@@ -209,18 +241,42 @@ jobs:
   release:
     name: Publish GitHub release
     needs: [gate, package]
+    # always(), because the build is deliberately skipped when the packages are
+    # being reused -- and a skipped dependency would otherwise skip this too.
     # workflow_dispatch still builds and uploads artifacts, so the packages can
     # be checked by hand without creating a release.
-    if: needs.gate.outputs.publish == 'true' && github.event_name == 'push'
+    if: >-
+      always()
+      && needs.gate.outputs.publish == 'true'
+      && github.event_name == 'push'
+      && (needs.package.result == 'success' || needs.package.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Downloading another run's artifacts is an Actions API call, not a
+      # contents one.
+      actions: read
     steps:
-      - name: Download desktop packages
+      - name: Download the packages built in this run
+        if: needs.gate.outputs.reuse == ''
         uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
+
+      # The pull request built and tested these exact files. Publishing them
+      # rather than making them again is the difference between one full matrix
+      # per release and two.
+      - name: Download the packages the pull request already built
+        if: needs.gate.outputs.reuse != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          gh run download "${{ needs.gate.outputs.reuse }}" --dir release-assets
+          echo "reused the packages from run ${{ needs.gate.outputs.reuse }}"
 
       - name: Flatten package directories
         shell: bash
