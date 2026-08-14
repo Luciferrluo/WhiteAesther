@@ -1,10 +1,14 @@
-import { Check, FileText, Power, Search, ShieldAlert, X, Zap } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Check, FileText, Gauge, Lock, Plug, Power, Radar, Search, ShieldAlert, X, Zap, type LucideIcon } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
+import { speedTest } from "@/core/api";
+import { ConnectOrb, type OrbState } from "./ConnectOrb";
+import { Sparkline } from "./Sparkline";
+import { type Sample, summarise } from "./latency";
 import { CARRY_OPTIONS, type CarryMode, describeCarry } from "./carry";
 import type { ConnectionProfile, CoreProbe, CoreSnapshot } from "@/types";
 
@@ -13,11 +17,14 @@ interface SimpleProps {
   profile: ConnectionProfile;
   probe: CoreProbe;
   carry: CarryMode;
+  latency: Sample[];
   onCarry: (mode: CarryMode) => void;
   onToggle: () => void;
   onAdvanced: () => void;
   onRetryStealth: () => void;
   onReport: () => void;
+  onProfile: (patch: Partial<ConnectionProfile>) => void;
+  onToast: (title: string, message: string, error?: boolean) => void;
 }
 
 const BUSY = new Set(["starting", "scanning", "connecting", "reconnecting"]);
@@ -25,240 +32,375 @@ const BUSY = new Set(["starting", "scanning", "connecting", "reconnecting"]);
 export function Simple(props: SimpleProps) {
   const { snapshot, probe } = props;
   const busy = BUSY.has(snapshot.state);
+  const failed = snapshot.state === "error";
+  const live = snapshot.state === "connected";
+
+  const orbState: OrbState = live ? "live" : busy ? "working" : failed ? "failed" : "idle";
+  const caption = live ? "Connected" : busy ? "Searching" : failed ? "Stopped" : "Tap to connect";
 
   return (
-    <div className="flex h-full items-center justify-center overflow-y-auto px-8 py-10">
-      <div className="flex w-full max-w-[560px] flex-col gap-6">
-        {snapshot.state === "connected" ? (
-          <Connected {...props} />
-        ) : busy ? (
-          <Searching {...props} />
-        ) : snapshot.state === "error" ? (
-          <Failed {...props} />
-        ) : (
-          <Idle {...props} available={probe.available} />
-        )}
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex min-h-0 flex-1 gap-5 px-5 pt-5">
+        <aside
+          className={[
+            "flex w-[386px] shrink-0 flex-col items-center justify-center rounded-xl border",
+            live ? "bg-[radial-gradient(120%_80%_at_50%_30%,hsl(var(--primary)/0.055),transparent_70%)]" : "",
+            busy ? "bg-[radial-gradient(120%_80%_at_50%_30%,hsl(var(--warning)/0.05),transparent_70%)]" : "",
+          ].join(" ")}
+        >
+          <ConnectOrb
+            state={orbState}
+            caption={caption}
+            disabled={!probe.available && !live && !busy}
+            onClick={props.onToggle}
+          />
+          <Headline {...props} />
+          <Actions {...props} />
+        </aside>
+
+        <div className="flex min-w-0 flex-1 flex-col gap-3.5">
+          {live ? <Connected {...props} /> : null}
+          {busy ? <Searching {...props} /> : null}
+          {failed ? <Failed {...props} /> : null}
+          {!live && !busy && !failed ? <Idle {...props} /> : null}
+        </div>
+      </div>
+
+      <div className="px-5 pb-4 pt-3.5">
+        <CarryPicker carry={props.carry} onCarry={props.onCarry} />
       </div>
     </div>
   );
 }
 
-function Heading({ title, children }: { title: React.ReactNode; children?: React.ReactNode }) {
+// ------------------------------------------------------------------ the panel
+
+function Headline({ snapshot, carry, probe }: SimpleProps) {
+  const live = snapshot.state === "connected";
+  const busy = BUSY.has(snapshot.state);
+  const failed = snapshot.state === "error";
+
+  const title = live ? "You're through" : busy ? "Testing paths out" : failed ? "Nothing got out" : "Ready when you are";
+  const detail = live
+    ? `${transportName(snapshot.transport)} · ${describeCarry(carry, snapshot.socksAddress)}`
+    : busy
+      ? (snapshot.statusMessage ?? "Testing paths out of this network.")
+      : failed
+        ? (snapshot.lastError ?? "Every path was refused.")
+        : probe.available
+          ? "WhiteAesther finds a route that works here."
+          : probe.message;
+
   return (
-    <div className="flex flex-col gap-2">
-      <h1 className="text-[34px] font-bold leading-[1.1] tracking-tight text-balance">{title}</h1>
-      {children ? <p className="text-[15px] leading-relaxed text-muted-foreground">{children}</p> : null}
+    <div className="mt-4 max-w-[320px] text-center">
+      <div className="text-[23px] font-bold leading-tight tracking-tight">{title}</div>
+      <p className="mt-1.5 line-clamp-3 text-[13px] leading-snug text-muted-foreground">{detail}</p>
     </div>
   );
 }
 
-function CarryPicker({ carry, onCarry, label }: Pick<SimpleProps, "carry" | "onCarry"> & { label?: string }) {
+/**
+ * Runs a real download through the tunnel and keeps the figure on the button.
+ *
+ * Disabled while it runs, because a second download competing with the first
+ * would make both of them read slow.
+ */
+function SpeedTest({ onToast }: Pick<SimpleProps, "onToast">) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<number | null>(null);
+
   return (
-    <div className="flex flex-col gap-3">
-      {label ? <span className="text-sm font-medium">{label}</span> : null}
-      <div className="grid grid-cols-3 gap-2.5">
-        {CARRY_OPTIONS.map((option) => {
-          const active = carry === option.id;
-          const Icon = option.icon;
-          return (
-            <button
-              key={option.id}
-              type="button"
-              disabled={option.disabled}
-              aria-pressed={active}
-              onClick={() => onCarry(option.id)}
-              title={option.disabled ? option.disabledReason : undefined}
-              className={[
-                "flex flex-col gap-2 rounded-lg border p-3.5 text-left transition-colors",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                option.disabled
-                  ? "cursor-not-allowed border-border/60 opacity-45"
-                  : active
-                    ? "border-primary bg-primary/10 ring-1 ring-primary"
-                    : "border-border bg-card hover:bg-accent",
-              ].join(" ")}
-            >
-              <div className="flex items-center justify-between">
-                <Icon className={active ? "size-[17px] text-primary" : "size-[17px] text-muted-foreground"} />
-                {active ? <Check className="size-[15px] text-primary" /> : null}
-              </div>
-              <div className="flex flex-col gap-0.5">
-                <span className="text-[13.5px] font-semibold leading-tight">{option.title}</span>
-                <span className="text-xs leading-snug text-muted-foreground">
-                  {option.disabled ? option.disabledReason : option.detail}
-                </span>
-              </div>
-            </button>
-          );
-        })}
+    <Button
+      variant="outline"
+      className="h-9 px-4"
+      disabled={busy}
+      onClick={async () => {
+        setBusy(true);
+        try {
+          const { mbps, seconds } = await speedTest();
+          setResult(mbps);
+          onToast("Speed test", `${mbps.toFixed(1)} Mbps down, over ${seconds.toFixed(1)} s.`);
+        } catch (error) {
+          setResult(null);
+          onToast("Speed test failed", error instanceof Error ? error.message : String(error), true);
+        } finally {
+          setBusy(false);
+        }
+      }}
+    >
+      <Gauge className={busy ? "animate-spin" : undefined} />
+      {busy ? "Measuring…" : result == null ? "Speed test" : `${result.toFixed(1)} Mbps`}
+    </Button>
+  );
+}
+
+function Actions({ snapshot, probe, onToggle, onRetryStealth, onToast }: SimpleProps) {
+  const live = snapshot.state === "connected";
+  const busy = BUSY.has(snapshot.state);
+  const failed = snapshot.state === "error";
+
+  if (busy)
+    return (
+      <Button variant="outline" className="mt-5 h-9 px-7" onClick={onToggle}>
+        Stop
+      </Button>
+    );
+  if (live)
+    return (
+      <div className="mt-5 flex gap-2.5">
+        <Button variant="outline" className="h-9 px-5" onClick={onToggle}>
+          <Power />
+          Disconnect
+        </Button>
+        <SpeedTest onToast={onToast} />
       </div>
-    </div>
-  );
-}
-
-function Idle({ carry, onCarry, onToggle, onAdvanced, available }: SimpleProps & { available: boolean }) {
+    );
+  if (failed)
+    return (
+      <Button className="mt-5 h-9 px-5" onClick={onRetryStealth}>
+        <Zap />
+        Try again with Stealth
+      </Button>
+    );
   return (
     <>
-      <div className="flex flex-col gap-4">
-        <Badge variant="outline" className="gap-2">
-          <span className="size-1.5 rounded-full bg-muted-foreground" />
-          Not connected
-        </Badge>
-        <Heading title={<>Find the route that works<br />on this network.</>}>
-          WhiteAesther tests real paths out and keeps the first one that actually carries traffic.
-        </Heading>
-      </div>
-      <CarryPicker carry={carry} onCarry={onCarry} label="How your traffic is carried" />
-      <Button size="lg" className="w-full" onClick={onToggle} disabled={!available}>
-        <Zap />
-        {available ? "Connect" : "Aether core not found"}
+      <Button size="lg" className="mt-5 h-11 px-11 text-[14.5px]" onClick={onToggle} disabled={!probe.available}>
+        <Zap className="size-[17px]" />
+        {probe.available ? "Connect" : "Aether core not found"}
       </Button>
-      <button
-        type="button"
-        onClick={onAdvanced}
-        className="self-start text-[13px] text-muted-foreground underline underline-offset-4 hover:text-foreground"
-      >
-        Something not working? Open advanced settings
-      </button>
+      <p className="mt-2.5 text-[11px] text-muted-foreground">
+        or press <Kbd>Ctrl</Kbd> <Kbd>Enter</Kbd>
+      </p>
     </>
   );
 }
 
-function Searching({ snapshot, carry, onCarry, onToggle }: SimpleProps) {
-  const attempt = snapshot.attempt;
-  // The supervisor's own words when it has them; they carry the countdown.
-  const detail = snapshot.statusMessage ?? "Testing paths out of this network.";
+function Kbd({ children }: { children: React.ReactNode }) {
+  return (
+    <kbd className="rounded border bg-muted px-1.5 py-0.5 font-sans text-[10px] font-semibold text-foreground">
+      {children}
+    </kbd>
+  );
+}
+
+// -------------------------------------------------------------------- content
+
+function Connected({ snapshot, profile, latency, onProfile }: SimpleProps) {
+  const summary = summarise(latency);
+  const shown = summary.last ?? snapshot.latencyMs;
+
   return (
     <>
-      <div className="flex flex-col gap-4">
-        <Badge variant="warn" className="gap-2">
-          <span className="size-1.5 animate-pulse rounded-full bg-current" />
-          {attempt > 0 ? `Searching · attempt ${attempt} of ${snapshot.maxAttempts}` : "Searching"}
-        </Badge>
-        <Heading title={<>Testing paths out<br />of this network.</>}>{detail}</Heading>
+      <div className="grid grid-cols-4 gap-2.5">
+        <Tile label="Edge" value={snapshot.endpoint ?? "—"} />
+        <Tile label="Transport" value={transportName(snapshot.transport)} plain />
+        <Tile label="Latency" value={shown == null ? "—" : `${Math.round(shown)} ms`} good />
+        <Uptime startedAt={snapshot.startedAt} />
       </div>
 
-      <Card className="p-4">
-        <div className="flex flex-col gap-3.5">
-          <Progress value={attempt > 0 ? Math.min(90, attempt * 12) : 25} />
-          <div className="flex flex-col gap-2.5 text-[13px]">
-            <Step icon={<Check className="size-[15px] text-primary" />} label="Identity ready" />
-            {attempt > 0 ? (
-              <Step
-                muted
-                icon={<X className="size-[15px] text-muted-foreground" />}
-                label={`${snapshot.transport === "masque-h2" ? "MASQUE H3" : "MASQUE H2"} — no reply`}
-              />
-            ) : null}
-            <Step
-              strong
-              icon={<Search className="size-[15px] text-primary" />}
-              label={`${transportName(snapshot.transport)} — testing gateways`}
+      <Card className="surface flex flex-1 flex-col p-4">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-[13px] font-semibold">Round-trip through the tunnel</h3>
+            <p className="mt-0.5 text-[11.5px] text-muted-foreground">
+              Measured every 5 s through the tunnel. Last 80 seconds.
+            </p>
+          </div>
+          <div className="flex shrink-0 gap-3.5 text-right">
+            <Figure label="min" value={summary.min == null ? "—" : Math.round(summary.min)} />
+            <Figure label="avg" value={summary.avg == null ? "—" : Math.round(summary.avg)} />
+            <Figure label="max" value={summary.max == null ? "—" : Math.round(summary.max)} />
+            <Figure
+              label="loss"
+              value={`${Math.round(summary.loss * 100)}%`}
+              tone={summary.loss > 0 ? "bad" : "good"}
             />
           </div>
         </div>
+        <div className="mt-3 flex flex-1 items-end">
+          {latency.length ? (
+            <Sparkline history={latency} height={280} />
+          ) : (
+            <div className="grid h-full w-full place-items-center text-[12.5px] text-muted-foreground">
+              Taking the first measurement…
+            </div>
+          )}
+        </div>
+        <div className="mt-1.5 flex justify-between font-mono text-[10.5px] text-muted-foreground">
+          <span>-80s</span>
+          <span>-60s</span>
+          <span>-40s</span>
+          <span>-20s</span>
+          <span>now</span>
+        </div>
       </Card>
 
-      <CarryPicker carry={carry} onCarry={onCarry} label="How your traffic is carried" />
-      <Button size="lg" variant="outline" className="w-full" onClick={onToggle}>
-        Stop
-      </Button>
+      <Card className="surface flex items-center gap-3.5 p-3">
+        <Toggle
+          icon={Plug}
+          label="Keep me connected"
+          help="Reconnect automatically if the route drops"
+          checked={profile.autoReconnect}
+          onChange={(autoReconnect) => onProfile({ autoReconnect })}
+        />
+        <div className="h-8 w-px shrink-0 bg-border" />
+        <Toggle
+          icon={Lock}
+          label="Block traffic if the tunnel drops"
+          help={
+            profile.killSwitch
+              ? "Apps fail closed. Disconnect to put the proxy back."
+              : "Apps fail closed instead of leaking"
+          }
+          checked={profile.killSwitch}
+          onChange={(killSwitch) => onProfile({ killSwitch })}
+        />
+      </Card>
     </>
+  );
+}
+
+function Toggle({
+  icon: Icon,
+  label,
+  help,
+  checked,
+  onChange,
+}: {
+  icon: LucideIcon;
+  label: string;
+  help: string;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <div className="flex min-w-0 flex-1 items-center gap-3">
+      <div
+        className={[
+          "grid size-[30px] shrink-0 place-items-center rounded-lg",
+          checked ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground",
+        ].join(" ")}
+      >
+        <Icon className="size-[15px]" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="text-[12.5px] font-semibold">{label}</div>
+        <div className="mt-px truncate text-[11px] text-muted-foreground">{help}</div>
+      </div>
+      <Switch checked={checked} onCheckedChange={onChange} />
+    </div>
+  );
+}
+
+function Searching({ snapshot }: SimpleProps) {
+  const attempt = snapshot.attempt;
+  return (
+    <Card className="surface flex flex-1 flex-col p-4">
+      <h3 className="text-[13px] font-semibold">What it is trying</h3>
+      <Progress className="mt-3" value={attempt > 0 ? Math.min(90, attempt * 12) : 25} />
+      <div className="mt-4 flex flex-col">
+        <Step done icon={<Check className="size-3.5" />} label="Device identity ready" />
+        {attempt > 0 ? (
+          <Step
+            icon={<X className="size-3.5" />}
+            label={`${snapshot.transport === "masque-h2" ? "MASQUE H3" : "MASQUE H2"} — no reply`}
+          />
+        ) : null}
+        <Step
+          active
+          icon={<Radar className="size-3.5" />}
+          label={`${transportName(snapshot.transport)} — testing gateways`}
+        />
+      </div>
+      <div className="mt-4 flex items-center gap-2.5 rounded-lg border border-primary/25 bg-primary/[0.06] p-2.5">
+        <Search className="size-3.5 shrink-0 text-primary" />
+        <span className="text-[12px] text-muted-foreground">
+          Retries alternate the two MASQUE transports on their own. Nothing to do.
+        </span>
+      </div>
+      {attempt > 0 ? (
+        <p className="mt-auto pt-3 text-[12px] text-muted-foreground">
+          Attempt {attempt} of {snapshot.maxAttempts}.
+        </p>
+      ) : null}
+    </Card>
   );
 }
 
 function Step({
   icon,
   label,
-  muted,
-  strong,
+  done,
+  active,
 }: {
   icon: React.ReactNode;
   label: string;
-  muted?: boolean;
-  strong?: boolean;
+  done?: boolean;
+  active?: boolean;
 }) {
   return (
-    <div className="flex items-center gap-2.5">
-      {icon}
-      <span className={muted ? "text-muted-foreground" : strong ? "font-medium" : ""}>{label}</span>
+    <div className="flex items-center gap-2.5 border-b py-2.5 last:border-b-0">
+      <span
+        className={[
+          "grid size-6 shrink-0 place-items-center rounded-full",
+          done ? "bg-primary/15 text-primary" : active ? "bg-warning/15 text-warning" : "bg-muted text-muted-foreground",
+        ].join(" ")}
+      >
+        {icon}
+      </span>
+      <span className={`text-[13px] ${done || active ? "" : "text-muted-foreground"}`}>{label}</span>
     </div>
   );
 }
 
-function Connected({ snapshot, profile, carry, onCarry, onToggle, onAdvanced }: SimpleProps) {
+function Idle({ snapshot, profile }: SimpleProps) {
   return (
-    <>
-      <div className="flex flex-col gap-4">
-        <Badge variant="ok" className="gap-2">
-          <span className="size-1.5 rounded-full bg-current" />
-          Connected
-        </Badge>
-        <Heading title="You're through.">
-          Traffic is carried over{" "}
-          <span className="font-mono text-sm text-foreground">{transportName(snapshot.transport)}</span>.{" "}
-          {describeCarry(carry, snapshot.socksAddress)}
-        </Heading>
+    <Card className="surface flex flex-1 flex-col p-4">
+      <h3 className="text-[13px] font-semibold">What will happen</h3>
+      <p className="mt-0.5 text-[11.5px] text-muted-foreground">
+        The route is found for you. These are the settings it will start from.
+      </p>
+      <div className="mt-3.5 flex flex-col">
+        <Fact label="Protocol" value={transportName(snapshot.transport ?? "masque-h2")} />
+        <Fact label="Search depth" value={profile.scanMode} />
+        <Fact label="Addresses" value={profile.ipFamily === "both" ? "IPv4 and IPv6" : profile.ipFamily} />
+        <Fact
+          label="Gateway"
+          value={profile.endpointMode === "automatic" ? "found automatically" : (profile.peer ?? "pinned")}
+        />
+        <Fact label="Local proxy" value={profile.socksAddress} />
       </div>
-
-      <Card>
-        <div className="flex items-stretch">
-          <Readout label="Edge" value={snapshot.endpoint ?? "—"} />
-          <Separator orientation="vertical" />
-          <Readout label="Latency" value={snapshot.latencyMs == null ? "—" : `${snapshot.latencyMs.toFixed(1)} ms`} />
-          <Separator orientation="vertical" />
-          <Readout label="Search" value={profile.scanMode} />
-        </div>
-      </Card>
-
-      <CarryPicker carry={carry} onCarry={onCarry} label="How your traffic is carried" />
-      <div className="flex gap-2">
-        <Button size="lg" variant="outline" className="flex-1" onClick={onToggle}>
-          <Power />
-          Disconnect
-        </Button>
-        <Button size="lg" variant="ghost" onClick={onAdvanced}>
-          Details
-        </Button>
-      </div>
-    </>
+      <p className="mt-auto pt-3 text-[12px] text-muted-foreground">
+        Retries alternate MASQUE H2 and H3 automatically, up to {snapshot.maxAttempts} attempts.
+      </p>
+    </Card>
   );
 }
 
-function Readout({ label, value }: { label: string; value: string }) {
+function Fact({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex flex-1 flex-col gap-1 p-4">
-      <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{label}</span>
-      <span className="tabular truncate font-mono text-[15px] font-medium">{value}</span>
+    <div className="flex items-center justify-between gap-4 border-b py-2 last:border-b-0">
+      <span className="text-[12.5px] text-muted-foreground">{label}</span>
+      <span className="tabular truncate font-mono text-[12.5px]">{value}</span>
     </div>
   );
 }
 
-function Failed({ snapshot, onRetryStealth, onReport, onAdvanced }: SimpleProps) {
+function Failed({ onReport, onAdvanced }: SimpleProps) {
   return (
-    <>
-      <div className="flex flex-col gap-4">
-        <Badge variant="bad" className="gap-2">
-          <span className="size-1.5 rounded-full bg-current" />
-          Stopped
-        </Badge>
-        <Heading title={<>Nothing got out<br />of this network.</>}>
-          {snapshot.lastError ?? "Every path was refused."}
-        </Heading>
-      </div>
-
+    <Card className="surface flex flex-1 flex-col p-4">
       <Alert variant="warning">
         <ShieldAlert />
         <AlertTitle>Three things to try, in order</AlertTitle>
         <AlertDescription>
           <div className="mt-1.5 flex flex-col gap-1">
             <span>
-              <b className="text-foreground">1</b>&nbsp; Switch search depth to <b className="text-foreground">Stealth</b> —
-              quieter probing, slower to connect
+              <b className="text-foreground">1</b>&nbsp; Switch search depth to{" "}
+              <b className="text-foreground">Stealth</b> — quieter probing, slower to connect
             </span>
             <span>
-              <b className="text-foreground">2</b>&nbsp; Set addresses to <b className="text-foreground">IPv4 only</b> if
-              this network handles IPv6 badly
+              <b className="text-foreground">2</b>&nbsp; Set addresses to{" "}
+              <b className="text-foreground">IPv4 only</b> if this network handles IPv6 badly
             </span>
             <span>
               <b className="text-foreground">3</b>&nbsp; Turn obfuscation up to{" "}
@@ -267,26 +409,122 @@ function Failed({ snapshot, onRetryStealth, onReport, onAdvanced }: SimpleProps)
           </div>
         </AlertDescription>
       </Alert>
-
-      <div className="flex gap-2">
-        <Button size="lg" className="flex-1" onClick={onRetryStealth}>
-          <Zap />
-          Try again with Stealth
-        </Button>
-        <Button size="lg" variant="outline" onClick={onReport}>
+      <div className="mt-auto flex gap-2 pt-4">
+        <Button variant="outline" className="flex-1" onClick={onReport}>
           <FileText />
-          Report
+          Build a report
+        </Button>
+        <Button variant="ghost" onClick={onAdvanced}>
+          Open Advanced
         </Button>
       </div>
-      <p className="text-center text-xs text-muted-foreground">
-        Or{" "}
-        <button type="button" onClick={onAdvanced} className="underline underline-offset-4 hover:text-foreground">
-          open Advanced
-        </button>{" "}
-        to change the transport and endpoint yourself.
-      </p>
-    </>
+    </Card>
   );
+}
+
+// --------------------------------------------------------------------- pieces
+
+function Tile({ label, value, plain, good }: { label: string; value: string; plain?: boolean; good?: boolean }) {
+  return (
+    <Card className="surface p-3">
+      <div className="text-[10px] font-bold uppercase tracking-[0.09em] text-muted-foreground">{label}</div>
+      <div
+        className={[
+          "mt-1 truncate text-[16px] font-semibold",
+          plain ? "" : "tabular font-mono",
+          good ? "text-primary" : "",
+        ].join(" ")}
+      >
+        {value}
+      </div>
+    </Card>
+  );
+}
+
+/** Ticks in its own component so the rest of the page does not re-render every second. */
+function Uptime({ startedAt }: { startedAt: number | null }) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (startedAt == null) return;
+    const timer = window.setInterval(() => setTick((value) => value + 1), 1_000);
+    return () => window.clearInterval(timer);
+  }, [startedAt]);
+  return <Tile label="Uptime" value={formatUptime(startedAt)} />;
+}
+
+function Figure({ label, value, tone }: { label: string; value: string | number; tone?: "good" | "bad" }) {
+  return (
+    <div>
+      <div className="text-[10px] font-bold uppercase tracking-[0.09em] text-muted-foreground">{label}</div>
+      <div
+        className={[
+          "tabular mt-0.5 font-mono text-[13px]",
+          tone === "good" ? "text-primary" : tone === "bad" ? "text-warning" : "",
+        ].join(" ")}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function CarryPicker({ carry, onCarry }: Pick<SimpleProps, "carry" | "onCarry">) {
+  return (
+    <div className="grid grid-cols-3 gap-2.5">
+      {CARRY_OPTIONS.map((option) => {
+        const active = carry === option.id;
+        const Icon = option.icon;
+        return (
+          <button
+            key={option.id}
+            type="button"
+            disabled={option.disabled}
+            aria-pressed={active}
+            onClick={() => onCarry(option.id)}
+            title={option.disabled ? option.disabledReason : undefined}
+            className={[
+              "surface flex items-start gap-3 rounded-xl border p-3.5 text-left transition-colors",
+              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              option.disabled
+                ? "cursor-not-allowed opacity-40"
+                : active
+                  ? "border-primary/55 bg-primary/[0.09] ring-1 ring-primary/30"
+                  : "hover:bg-accent",
+            ].join(" ")}
+          >
+            <div
+              className={[
+                "grid size-8 shrink-0 place-items-center rounded-[9px]",
+                active ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground",
+              ].join(" ")}
+            >
+              <Icon className="size-[17px]" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5">
+                <span className="text-[13.5px] font-semibold">{option.title}</span>
+                {active ? <Check className="size-3.5 text-primary" /> : null}
+              </div>
+              <div className="mt-0.5 text-[11.5px] leading-snug text-muted-foreground">
+                {option.disabled ? option.disabledReason : option.detail}
+              </div>
+            </div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------- utils
+
+export function formatUptime(startedAt: number | null): string {
+  if (startedAt == null) return "—";
+  const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  return `${hours}:${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
 }
 
 const TRANSPORT_NAMES: Record<string, string> = {

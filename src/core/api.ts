@@ -68,7 +68,7 @@ export async function subscribeCore(
   return () => { unlistenStatus(); unlistenLog(); };
 }
 
-export type TrayAction = "toggle-connection" | "open-diagnostics";
+export type TrayAction = "toggle-connection" | "open-diagnostics" | "restore-proxy";
 
 export async function subscribeTrayActions(onAction: (action: TrayAction) => void): Promise<UnlistenFn> {
   requireDesktop();
@@ -104,6 +104,29 @@ export async function testEndpoint(profile: ConnectionProfile, endpoint: string)
 export async function cancelScan(): Promise<boolean> {
   requireDesktop();
   return invoke("cancel_scan");
+}
+
+/**
+ * Times one round trip through the live tunnel, in milliseconds.
+ *
+ * Null means there was nothing to measure — no tunnel, or a probe that did not
+ * come back. Both are ordinary while a route is settling.
+ */
+export async function probeLatency(): Promise<number | null> {
+  requireDesktop();
+  return invoke("probe_latency");
+}
+
+export interface SpeedResult {
+  mbps: number;
+  bytes: number;
+  seconds: number;
+}
+
+/** Downloads a fixed payload through the tunnel and reports the throughput. */
+export async function speedTest(): Promise<SpeedResult> {
+  requireDesktop();
+  return invoke("speed_test");
 }
 
 /**

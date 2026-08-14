@@ -113,9 +113,9 @@ fn serve(mut client: TcpStream, socks: SocketAddr) -> io::Result<()> {
         let Some((host, port)) = split_authority(&target, 443) else {
             return respond(&mut client, 400, "Bad Request");
         };
-        let upstream = match socks5_connect(socks, &host, port) {
+        let upstream = match socks5_connect(socks, &host, port, HANDSHAKE_TIMEOUT) {
             Ok(upstream) => upstream,
-            Err(_) => return respond(&mut client, 502, "Bad Gateway"),
+            Err(_) => return respond_unreachable(&mut client),
         };
         client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
         client.set_read_timeout(None)?;
@@ -128,9 +128,9 @@ fn serve(mut client: TcpStream, socks: SocketAddr) -> io::Result<()> {
     let Some((host, port, path)) = split_absolute_uri(&target) else {
         return respond(&mut client, 400, "Bad Request");
     };
-    let mut upstream = match socks5_connect(socks, &host, port) {
+    let mut upstream = match socks5_connect(socks, &host, port, HANDSHAKE_TIMEOUT) {
         Ok(upstream) => upstream,
-        Err(_) => return respond(&mut client, 502, "Bad Gateway"),
+        Err(_) => return respond_unreachable(&mut client),
     };
 
     let mut head = format!("{method} {path} HTTP/1.1\r\n");
@@ -169,6 +169,33 @@ fn respond(client: &mut TcpStream, code: u16, reason: &str) -> io::Result<()> {
     write!(client, "HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 }
 
+/// The page shown when the tunnel cannot be reached.
+///
+/// A bare 502 renders as the browser's own "can't reach this site", which
+/// invites the reader to blame their network and start disabling things. When
+/// the kill switch is holding traffic this is the *intended* outcome, so it
+/// should say so in words the person can act on.
+fn respond_unreachable(client: &mut TcpStream) -> io::Result<()> {
+    const BODY: &str = "<!doctype html><meta charset=\"utf-8\">\
+<title>Blocked by WhiteAesther</title>\
+<style>body{background:#0a0a0b;color:#f2f2f3;font:16px/1.6 system-ui,sans-serif;\
+display:grid;place-items:center;height:100vh;margin:0}\
+main{max-width:30rem;padding:2rem}h1{font-size:1.35rem;margin:0 0 .75rem}\
+p{color:#a1a4ad;margin:0 0 .75rem}b{color:#4ade80}</style>\
+<main><h1>Traffic is blocked, not broken</h1>\
+<p>WhiteAesther could not reach the tunnel, so this request was <b>held rather than \
+sent in the clear</b>.</p>\
+<p>The search for a working route is still running in the background, and this page \
+will stop appearing as soon as one is found.</p>\
+<p>To go back to an ordinary connection, open WhiteAesther and disconnect.</p></main>";
+    write!(
+        client,
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{BODY}",
+        BODY.len()
+    )
+}
+
 /// `host:port`, with IPv6 in brackets.
 fn split_authority(target: &str, default_port: u16) -> Option<(String, u16)> {
     if let Some(rest) = target.strip_prefix('[') {
@@ -202,9 +229,20 @@ fn split_absolute_uri(target: &str) -> Option<(String, u16, String)> {
 ///
 /// The name is passed through as a domain rather than resolved here, so DNS
 /// happens inside the tunnel instead of leaking to the local resolver.
-fn socks5_connect(socks: SocketAddr, host: &str, port: u16) -> io::Result<TcpStream> {
-    let mut upstream = TcpStream::connect_timeout(&socks, HANDSHAKE_TIMEOUT)?;
-    upstream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+/// Opens a tunnelled connection through the SOCKS5 listener.
+///
+/// `timeout` bounds the connect and every read of the handshake. The bridge
+/// gives it a generous value because a browser is waiting on the far side; the
+/// latency probe gives it a short one, because a sample that has not landed is
+/// worth less than the next sample.
+pub(crate) fn socks5_connect(
+    socks: SocketAddr,
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let mut upstream = TcpStream::connect_timeout(&socks, timeout)?;
+    upstream.set_read_timeout(Some(timeout))?;
     upstream.set_nodelay(true)?;
 
     // Greeting: SOCKS5, one method, "no authentication".

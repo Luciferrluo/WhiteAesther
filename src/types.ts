@@ -49,6 +49,10 @@ export interface ConnectionProfile {
   gateway: boolean;
   /** Point the OS proxy at the SOCKS listener while connected. */
   systemProxy: boolean;
+  /** Keep retrying after a route drops, rather than leaving it dead. */
+  autoReconnect: boolean;
+  /** Leave the system proxy on a dead tunnel so apps fail rather than leak. */
+  killSwitch: boolean;
 }
 
 export interface CoreSnapshot {
@@ -66,6 +70,8 @@ export interface CoreSnapshot {
   statusMessage: string | null;
   attempt: number;
   maxAttempts: number;
+  /** The kill switch is holding traffic while the supervisor keeps searching. */
+  blocking: boolean;
 }
 
 export interface CoreLogEvent {
@@ -121,6 +127,8 @@ export const DEFAULT_PROFILE: ConnectionProfile = {
   accessToken: null,
   gateway: false,
   systemProxy: false,
+  autoReconnect: true,
+  killSwitch: false,
 };
 
 export const IDLE_SNAPSHOT: CoreSnapshot = {
@@ -137,4 +145,5 @@ export const IDLE_SNAPSHOT: CoreSnapshot = {
   statusMessage: null,
   attempt: 0,
   maxAttempts: 8,
+  blocking: false,
 };

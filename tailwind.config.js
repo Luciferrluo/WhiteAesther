@@ -6,6 +6,11 @@ export default {
     extend: {
       colors: {
         border: "hsl(var(--border))",
+        "border-strong": "hsl(var(--border-strong))",
+        sidebar: {
+          DEFAULT: "hsl(var(--sidebar))",
+          foot: "hsl(var(--sidebar-foot))",
+        },
         input: "hsl(var(--input))",
         ring: "hsl(var(--ring))",
         background: "hsl(var(--background))",
