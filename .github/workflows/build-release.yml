@@ -41,15 +41,41 @@ jobs:
             packages: |
               src-tauri/target/release/bundle/nsis/*.exe
               src-tauri/target/release/bundle/msi/*.msi
+          # NSIS only. WiX's arm64 support is not worth a failing release job for
+          # a second installer format nobody asked for; the .exe installs the
+          # same application.
+          - os: windows-11-arm
+            name: Windows arm64
+            artifact: windows-arm64
+            core: aether.exe
+            bundles: nsis
+            packages: src-tauri/target/release/bundle/nsis/*.exe
           - os: macos-latest
-            name: macOS
-            artifact: macos
+            name: macOS Apple Silicon
+            artifact: macos-arm64
+            core: aether
+            bundles: dmg
+            packages: src-tauri/target/release/bundle/dmg/*.dmg
+          # Every Mac sold before late 2020. macos-15-intel is the current Intel
+          # image; the macos-13 that used to fill this role has been retired.
+          - os: macos-15-intel
+            name: macOS Intel
+            artifact: macos-x64
             core: aether
             bundles: dmg
             packages: src-tauri/target/release/bundle/dmg/*.dmg
           - os: ubuntu-22.04
             name: Linux x64
             artifact: linux-x64
+            core: aether
+            bundles: deb,rpm,appimage
+            packages: |
+              src-tauri/target/release/bundle/deb/*.deb
+              src-tauri/target/release/bundle/rpm/*.rpm
+              src-tauri/target/release/bundle/appimage/*.AppImage
+          - os: ubuntu-22.04-arm
+            name: Linux arm64
+            artifact: linux-arm64
             core: aether
             bundles: deb,rpm,appimage
             packages: |
@@ -165,7 +191,15 @@ jobs:
           done < <(find release-assets -type f -print0)
           rm -rf release-assets
           mv flattened-assets release-assets
-          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 6
+
+          # 2 Windows x64 (exe, msi) + 1 Windows arm64 (exe) + 2 macOS (dmg each)
+          # + 3 Linux x64 (deb, rpm, AppImage) + 3 Linux arm64 = 11.
+          #
+          # Flattening means two packages with the same name would silently
+          # overwrite each other, so this count is also the check that every
+          # architecture produced a distinctly named installer. Update it when
+          # the matrix changes.
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 11
 
       - name: Create installer pack and SHA-256 checksums
         shell: bash
