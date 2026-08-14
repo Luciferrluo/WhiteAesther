@@ -20,7 +20,10 @@ import {
 
 const ACTIVE = new Set(["starting", "scanning", "connecting", "connected", "reconnecting"]);
 const MODE_KEY = "whiteaesther.mode";
-const appVersion = import.meta.env.VITE_APP_VERSION || "1.0.0";
+// Supplied by vite.config from package.json, or overridden by CI. No fallback
+// version here on purpose: a wrong number in the footer is worse than a missing
+// one, because it is the first thing a bug report quotes.
+const appVersion = import.meta.env.VITE_APP_VERSION || "unknown";
 
 type Mode = "simple" | "advanced";
 type Toast = { title: string; message: string; error?: boolean };
