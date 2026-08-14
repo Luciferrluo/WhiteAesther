@@ -61,12 +61,18 @@ pub async fn test_endpoint(
     supervisor.require_idle("Disconnect before testing an endpoint")?;
     let inner: CoreSupervisor = (*supervisor).clone();
     tauri::async_runtime::spawn_blocking(move || {
+        // The transport the profile is set to, not a fixed one. A gateway can
+        // answer over TCP and be unusable over QUIC -- on a network that
+        // interferes with UDP, every H3 endpoint fails while H2 succeeds -- so
+        // testing the wrong transport reports an endpoint as good that the next
+        // connect cannot use.
+        let transport = transport_of(&profile);
         let value = run_report(
             &app,
             &inner,
             &profile,
             &["--test-endpoint".into(), endpoint],
-            "h2",
+            transport,
         )?;
         candidate_from(&value).ok_or_else(|| "the core gave an unreadable answer".to_string())
     })
@@ -79,13 +85,21 @@ pub fn cancel_scan(supervisor: State<'_, CoreSupervisor>) -> bool {
     supervisor.cancel_scan()
 }
 
+/// Which MASQUE transport the profile is set to.
+///
+/// The scan and the endpoint test both need this: probing over the wrong one
+/// answers a question the user did not ask.
+fn transport_of(profile: &CoreProfile) -> &'static str {
+    if profile.masque_transport == "h2" { "h2" } else { "h3" }
+}
+
 fn scan_blocking(
     app: &AppHandle,
     supervisor: &CoreSupervisor,
     profile: &CoreProfile,
     limit: u32,
 ) -> Result<ScanOutcome, String> {
-    let configured = if profile.masque_transport == "h2" { "h2" } else { "h3" };
+    let configured = transport_of(profile);
     let args = vec!["--scan-only".to_string(), "--scan-limit".into(), limit.to_string()];
 
     let first = run_report(app, supervisor, profile, &args, configured)?;
@@ -119,6 +133,9 @@ fn run_report(
 
     let mut command = Command::new(&core_path);
     command
+        // MASQUE regardless of the profile's protocol: the core's reporting
+        // modes wrap scan_embedded, which has no WireGuard or WARP-in-WARP
+        // path. The panel says so rather than quietly scanning the wrong thing.
         .arg("--masque")
         .args(["--scan", &profile.scan_mode])
         .args(["--ip", &profile.ip_family])

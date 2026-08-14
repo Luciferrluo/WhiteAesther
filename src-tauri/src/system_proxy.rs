@@ -48,6 +48,18 @@ pub struct MacProxyService {
     pub port: u16,
 }
 
+/// Where each platform should be pointed.
+///
+/// macOS and GNOME speak SOCKS5 and are given the core's listener directly.
+/// Windows is given the local HTTP bridge instead: WinINET's SOCKS is version 4
+/// and Chrome and Edge ignore the `socks=` key entirely, so pointing it at a
+/// SOCKS5 listener sets a value almost nothing obeys.
+#[derive(Debug, Clone, Copy)]
+pub struct ProxyTargets {
+    pub socks: SocketAddr,
+    pub http: SocketAddr,
+}
+
 fn backup_path(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
@@ -64,7 +76,7 @@ pub fn is_applied(app: &AppHandle) -> bool {
 /// Re-applying while already applied deliberately does not touch the backup --
 /// capturing our own settings as "the previous value" is how a tool like this
 /// makes a proxy permanent.
-pub fn apply(app: &AppHandle, socks: SocketAddr) -> Result<(), String> {
+pub fn apply(app: &AppHandle, targets: ProxyTargets) -> Result<(), String> {
     let path = backup_path(app)?;
     if !path.exists() {
         let current = platform::read()?;
@@ -79,7 +91,7 @@ pub fn apply(app: &AppHandle, socks: SocketAddr) -> Result<(), String> {
         std::fs::write(&path, bytes)
             .map_err(|error| format!("cannot save the current proxy settings: {error}"))?;
     }
-    platform::apply(socks)
+    platform::apply(targets)
 }
 
 /// Puts the settings back and forgets the backup.
@@ -115,7 +127,6 @@ pub fn recover(app: &AppHandle) -> Result<bool, String> {
 #[cfg(target_os = "windows")]
 mod platform {
     use super::ProxyBackup;
-    use std::net::SocketAddr;
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     use winreg::RegKey;
 
@@ -136,9 +147,14 @@ mod platform {
         })
     }
 
-    pub fn apply(socks: SocketAddr) -> Result<(), String> {
+    pub fn apply(targets: super::ProxyTargets) -> Result<(), String> {
         let key = settings_key(KEY_READ | KEY_WRITE)?;
-        write(&key, 1_u32, &super::windows_proxy_server(socks), "<local>")?;
+        write(
+            &key,
+            1_u32,
+            &super::windows_proxy_server(targets.http),
+            super::WINDOWS_BYPASS,
+        )?;
         notify();
         Ok(())
     }
@@ -191,7 +207,6 @@ mod platform {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::{MacProxyService, ProxyBackup};
-    use std::net::SocketAddr;
     use std::process::Command;
 
     pub fn read() -> Result<ProxyBackup, String> {
@@ -206,10 +221,10 @@ mod platform {
         Ok(ProxyBackup::Macos { services })
     }
 
-    pub fn apply(socks: SocketAddr) -> Result<(), String> {
+    pub fn apply(targets: super::ProxyTargets) -> Result<(), String> {
         for name in list_services()? {
-            let port = socks.port().to_string();
-            let host = socks.ip().to_string();
+            let port = targets.socks.port().to_string();
+            let host = targets.socks.ip().to_string();
             networksetup(&["-setsocksfirewallproxy", &name, &host, &port])?;
             networksetup(&["-setsocksfirewallproxystate", &name, "on"])?;
         }
@@ -263,7 +278,6 @@ mod platform {
 #[cfg(all(unix, not(target_os = "macos")))]
 mod platform {
     use super::ProxyBackup;
-    use std::net::SocketAddr;
     use std::process::Command;
 
     const SCHEMA: &str = "org.gnome.system.proxy";
@@ -278,9 +292,9 @@ mod platform {
         })
     }
 
-    pub fn apply(socks: SocketAddr) -> Result<(), String> {
-        gsettings(&["set", &socks_schema(), "host", &socks.ip().to_string()])?;
-        gsettings(&["set", &socks_schema(), "port", &socks.port().to_string()])?;
+    pub fn apply(targets: super::ProxyTargets) -> Result<(), String> {
+        gsettings(&["set", &socks_schema(), "host", &targets.socks.ip().to_string()])?;
+        gsettings(&["set", &socks_schema(), "port", &targets.socks.port().to_string()])?;
         gsettings(&["set", SCHEMA, "mode", "manual"])?;
         Ok(())
     }
@@ -314,11 +328,20 @@ mod platform {
     }
 }
 
-/// WinINET's proxy list format. SOCKS is named rather than given as a bare
-/// `host:port`, which would be read as an HTTP proxy.
+/// Loopback and private ranges never go through the tunnel: sending them there
+/// breaks local development servers and printers for no benefit.
 #[cfg(any(target_os = "windows", test))]
-fn windows_proxy_server(socks: SocketAddr) -> String {
-    format!("socks={socks}")
+const WINDOWS_BYPASS: &str = "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*";
+
+/// WinINET's proxy list, naming the HTTP bridge for both schemes.
+///
+/// Not `socks=`: that key means SOCKS4 to WinINET, and Chrome and Edge skip it
+/// altogether. Naming http and https explicitly, rather than a bare
+/// `host:port`, leaves ftp and everything else direct instead of sending it to
+/// a proxy that only speaks HTTP.
+#[cfg(any(target_os = "windows", test))]
+fn windows_proxy_server(http: SocketAddr) -> String {
+    format!("http={http};https={http}")
 }
 
 /// `networksetup -listallnetworkservices` prints an explanatory first line, and
@@ -365,9 +388,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn windows_names_the_protocol_so_socks_is_not_read_as_http() {
-        let socks: SocketAddr = "127.0.0.1:1819".parse().unwrap();
-        assert_eq!(windows_proxy_server(socks), "socks=127.0.0.1:1819");
+    fn windows_is_pointed_at_the_http_bridge_not_at_socks() {
+        // "socks=" is the syntactically correct way to declare a SOCKS proxy and
+        // very nearly useless: WinINET reads it as SOCKS4, and Chrome and Edge
+        // ignore it. Naming both schemes against the bridge is what applications
+        // actually follow.
+        let bridge: SocketAddr = "127.0.0.1:52310".parse().unwrap();
+        let value = windows_proxy_server(bridge);
+        assert_eq!(value, "http=127.0.0.1:52310;https=127.0.0.1:52310");
+        assert!(!value.contains("socks="), "SOCKS must not be advertised to WinINET");
+    }
+
+    #[test]
+    fn the_windows_bypass_keeps_local_traffic_off_the_tunnel() {
+        for expected in ["<local>", "localhost", "127.*", "192.168.*", "10.*"] {
+            assert!(WINDOWS_BYPASS.contains(expected), "missing bypass: {expected}");
+        }
+        assert!(!WINDOWS_BYPASS.contains(" "), "WinINET splits this list on semicolons only");
     }
 
     #[test]

@@ -105,3 +105,12 @@ export async function cancelScan(): Promise<boolean> {
   requireDesktop();
   return invoke("cancel_scan");
 }
+
+/**
+ * Applies or removes the system proxy on a connection that is already up.
+ * Returns whether it is now applied.
+ */
+export async function setSystemProxy(enabled: boolean): Promise<boolean> {
+  requireDesktop();
+  return invoke("set_system_proxy", { enabled });
+}
