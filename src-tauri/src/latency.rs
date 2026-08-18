@@ -148,9 +148,125 @@ fn download(socks: SocketAddr) -> Result<SpeedResult, String> {
     })
 }
 
+/// What the rest of the internet sees when this tunnel is up.
+///
+/// The screen has always shown the *edge* -- the Cloudflare gateway the tunnel
+/// connects to -- which is not the same thing as the address a website reads,
+/// and users reasonably read one as the other. This reports the address that
+/// actually leaves.
+const TRACE_HOST: &str = "www.cloudflare.com";
+const TRACE_PATH: &str = "/cdn-cgi/trace";
+const TRACE_TIMEOUT: Duration = Duration::from_secs(12);
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExitInfo {
+    /// The address a website logs for this connection.
+    pub ip: String,
+    /// Two-letter country as Cloudflare geolocates that address.
+    pub country: String,
+    /// The datacentre the traffic left from, as a three-letter airport code.
+    pub colo: String,
+    /// Whether Cloudflare sees this connection as WARP at all. False here means
+    /// the request went out around the tunnel, not through it.
+    pub warp: bool,
+    /// Whether an organisation's Zero Trust gateway is applying policy.
+    pub gateway: bool,
+}
+
+/// Reads the exit address and country from inside the tunnel.
+#[tauri::command]
+pub async fn exit_info(supervisor: State<'_, CoreSupervisor>) -> Result<ExitInfo, String> {
+    let socks = supervisor
+        .connected_socks()
+        .ok_or("connect first — there is nothing to look up")?;
+    let address: SocketAddr = socks
+        .parse()
+        .map_err(|_| format!("the proxy address {socks} cannot be parsed"))?;
+
+    tauri::async_runtime::spawn_blocking(move || fetch_trace(address))
+        .await
+        .map_err(|error| format!("the lookup did not finish: {error}"))?
+}
+
+fn fetch_trace(socks: SocketAddr) -> Result<ExitInfo, String> {
+    // Plain HTTP on purpose: this crate has no TLS client, and the endpoint
+    // answers over both. Nothing here is secret -- it is the address a website
+    // would read anyway -- and it travels inside the tunnel regardless.
+    let body = http_get(socks, TRACE_HOST, TRACE_PATH, TRACE_TIMEOUT)?;
+    let field = |name: &str| {
+        body.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .map(str::trim)
+            .map(str::to_string)
+    };
+
+    Ok(ExitInfo {
+        ip: field("ip").ok_or("the reply carried no address")?,
+        country: field("loc").unwrap_or_else(|| "??".into()),
+        colo: field("colo").unwrap_or_default(),
+        warp: field("warp").as_deref() == Some("on"),
+        gateway: field("gateway").as_deref() == Some("on"),
+    })
+}
+
+/// A plain GET through the tunnel, returning the body.
+fn http_get(socks: SocketAddr, host: &str, path: &str, timeout: Duration) -> Result<String, String> {
+    let mut stream = socks5_connect(socks, host, 80, timeout)
+        .map_err(|error| format!("the tunnel refused the connection: {error}"))?;
+    stream.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+    stream
+        .write_all(
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: WhiteAesther\r\n\
+                 Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .map_err(|error| format!("could not send the request: {error}"))?;
+
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|error| format!("the reply was cut short: {error}"))?;
+    let text = String::from_utf8_lossy(&raw);
+    // Headers and body are split by a blank line; only the body is wanted.
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .ok_or("the reply was not a complete HTTP response")?;
+    Ok(body.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trace_reply_is_read_into_its_fields() {
+        // Verbatim shape of a cdn-cgi/trace body, which is line-oriented
+        // key=value and not JSON.
+        let body = "fl=129f135\nh=www.cloudflare.com\nip=104.28.51.7\nts=1787049464.000\n\
+                    colo=FRA\nloc=DE\nwarp=on\ngateway=off\n";
+        let field = |name: &str| {
+            body.lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .map(str::trim)
+                .map(str::to_string)
+        };
+        assert_eq!(field("ip").as_deref(), Some("104.28.51.7"));
+        assert_eq!(field("loc").as_deref(), Some("DE"));
+        assert_eq!(field("warp").as_deref(), Some("on"));
+        // "gateway=off" must not be mistaken for the "gateway" prefix of
+        // another key, and must read as false rather than missing.
+        assert_eq!(field("gateway").as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn a_lookup_against_a_dead_listener_fails_rather_than_inventing_a_country() {
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(fetch_trace(dead).is_err());
+    }
 
     #[test]
     fn a_download_from_a_dead_listener_fails_rather_than_reporting_zero() {
