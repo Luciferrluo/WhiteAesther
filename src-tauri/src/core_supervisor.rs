@@ -12,6 +12,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use crate::chain::{Chain, ChainSettings};
 use crate::http_bridge::{self, HttpBridge};
 use crate::system_proxy::{self, ProxyTargets};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -76,6 +77,8 @@ pub struct CoreProfile {
     /// Keep trying after a route drops. Off, a session that dies is left dead
     /// rather than retried, which is what someone debugging a network wants.
     pub auto_reconnect: bool,
+    /// The second hop, and where its nodes come from.
+    pub chain: ChainSettings,
     /// Leave the system proxy pointed at the dead listener when the tunnel
     /// fails, so applications that follow it fail rather than send the traffic
     /// in the clear.
@@ -109,6 +112,7 @@ impl Default for CoreProfile {
             performance_profile: "auto".into(),
             keepalive_secs: 5,
             auto_reconnect: true,
+            chain: ChainSettings::default(),
             kill_switch: false,
             noize: "balanced".into(),
             profile_retry: true,
@@ -1350,20 +1354,88 @@ fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: S
     // fresh problem and gets the full retry budget again. Kept out of the
     // snapshot lock above so the two are never held at once.
     if connected {
-        let wanted = {
+        let (wanted, chain_settings) = {
             let mut guard = lock(&inner.session);
             match guard.as_mut() {
                 Some(session) => {
                     session.attempt = 0;
-                    session.profile.system_proxy
+                    (session.profile.system_proxy, session.profile.chain.clone())
                 }
-                None => false,
+                None => (false, ChainSettings::default()),
             }
         };
+
+        let socks = lock(&inner.snapshot).socks_address.clone();
+
+        // The chain comes up before the proxy is pointed anywhere, because the
+        // whole question of *where* to point it is answered by whether the
+        // chain is carrying traffic. Starting them the other way round would
+        // aim the machine at the tunnel for as long as mihomo took to load a
+        // subscription -- traffic leaving with the wrong exit address, at the
+        // exact moment the user believes the opposite.
+        let carrier = if chain_settings.enabled {
+            match socks.parse::<SocketAddr>() {
+                Ok(tunnel) => match app.state::<Chain>().start(app, tunnel, &chain_settings) {
+                    Ok(address) => {
+                        supervisor_log(
+                            app,
+                            inner,
+                            "info",
+                            format!("chain listening on {address}; every node dials through the tunnel"),
+                        );
+                        Some(address)
+                    }
+                    Err(error) => {
+                        // Say which hop failed. "No route" would be a lie: the
+                        // tunnel is up and it is the second hop that did not.
+                        supervisor_log(
+                            app,
+                            inner,
+                            "error",
+                            format!("the tunnel is up but the chain did not start: {error}"),
+                        );
+                        None
+                    }
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         if wanted {
-            let socks = lock(&inner.snapshot).socks_address.clone();
-            apply_system_proxy(app, inner, &socks);
+            match carrier {
+                // mihomo's mixed listener speaks HTTP itself, so it is what the
+                // system proxy points at and the bridge is not needed at all.
+                Some(address) => apply_chain_proxy(app, inner, address),
+                None => apply_system_proxy(app, inner, &socks),
+            }
         }
+    }
+}
+
+/// Points the system proxy at the chain rather than at the tunnel.
+fn apply_chain_proxy(app: &AppHandle, inner: &SupervisorInner, address: SocketAddr) {
+    if inner.proxy_applied.load(Ordering::SeqCst) {
+        return;
+    }
+    let targets = ProxyTargets { socks: address, http: address };
+    match system_proxy::apply(app, targets) {
+        Ok(()) => {
+            inner.proxy_applied.store(true, Ordering::SeqCst);
+            supervisor_log(
+                app,
+                inner,
+                "info",
+                format!("system proxy set to the chain at {address}"),
+            );
+        }
+        Err(error) => supervisor_log(
+            app,
+            inner,
+            "warn",
+            format!("could not set the system proxy: {error}"),
+        ),
     }
 }
 
@@ -1432,6 +1504,10 @@ fn apply_system_proxy(app: &AppHandle, inner: &SupervisorInner, socks: &str) {
 /// a proxy left pointing at a listener that no longer exists takes the machine
 /// off the network.
 fn clear_system_proxy(app: &AppHandle, inner: &SupervisorInner) {
+    // The chain exists only to carry a live tunnel's traffic. Leaving it up
+    // after the proxy is restored would keep a listener alive that dials
+    // through a SOCKS port nothing is answering on.
+    app.state::<Chain>().stop();
     // Whatever else happens, the proxy is going back, so nothing is held any
     // more. Cleared unconditionally: the flag must never outlive the block, or
     // the screen tells the user they are protected when they are not.

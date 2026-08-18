@@ -1,15 +1,60 @@
+mod chain;
 mod core_supervisor;
 mod http_bridge;
 mod latency;
 mod scanner;
 mod system_proxy;
 
+use chain::Chain;
 use core_supervisor::CoreSupervisor;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager,
 };
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChainStatus {
+    running: bool,
+    /// Where applications and the system proxy point while the chain carries
+    /// traffic. None means the tunnel is carrying it directly.
+    address: Option<String>,
+}
+
+/// Whether the second hop is up, and what it is listening on.
+#[tauri::command]
+async fn chain_status(chain: tauri::State<'_, Chain>) -> Result<ChainStatus, String> {
+    Ok(ChainStatus {
+        running: chain.is_running(),
+        address: chain.address().map(|value| value.to_string()),
+    })
+}
+
+/// Every node the chain knows about, with the delay each last recorded.
+#[tauri::command]
+async fn chain_nodes(chain: tauri::State<'_, Chain>) -> Result<Vec<chain::ChainNode>, String> {
+    chain.nodes()
+}
+
+/// Measures one node through the tunnel.
+///
+/// The same call answers "does this config work from here" and "how fast is
+/// it", because the probe travels the node's own dialer-proxy: a number means
+/// it is usable behind the tunnel, and nothing means it is not.
+#[tauri::command]
+async fn chain_test(
+    chain: tauri::State<'_, Chain>,
+    source: String,
+    node: String,
+) -> Result<Option<u32>, String> {
+    chain.test(&source, &node)
+}
+
+#[tauri::command]
+async fn chain_select(chain: tauri::State<'_, Chain>, node: String) -> Result<(), String> {
+    chain.select(&node)
+}
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -34,6 +79,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(CoreSupervisor::new())
+        .manage(Chain::new())
         .setup(|app| {
             // A previous run that was killed rather than closed may have left
             // the system proxy pointing at a listener that is now gone, which
@@ -148,6 +194,10 @@ pub fn run() {
             latency::probe_latency,
             latency::speed_test,
             latency::exit_info,
+            chain_status,
+            chain_nodes,
+            chain_test,
+            chain_select,
         ])
         .build(tauri::generate_context!())
         .expect("error while running WhiteAesther")

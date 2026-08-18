@@ -146,6 +146,47 @@ export async function exitInfo(): Promise<ExitInfo> {
   return invoke("exit_info");
 }
 
+export interface ChainStatus {
+  running: boolean;
+  /** Where traffic is carried while the chain is up, or null when it is not. */
+  address: string | null;
+}
+
+export interface ChainNode {
+  name: string;
+  /** Which subscription supplied it. */
+  source: string;
+  kind: string;
+  /** Milliseconds through the tunnel, or null when the last test failed. */
+  delay: number | null;
+}
+
+export async function chainStatus(): Promise<ChainStatus> {
+  requireDesktop();
+  return invoke("chain_status");
+}
+
+export async function chainNodes(): Promise<ChainNode[]> {
+  requireDesktop();
+  return invoke("chain_nodes");
+}
+
+/**
+ * Measures one node through the tunnel.
+ *
+ * Null means the node could not be reached from behind the tunnel — which is
+ * the answer the dashboard needs, not an error to report.
+ */
+export async function chainTest(source: string, node: string): Promise<number | null> {
+  requireDesktop();
+  return invoke("chain_test", { source, node });
+}
+
+export async function chainSelect(node: string): Promise<void> {
+  requireDesktop();
+  return invoke("chain_select", { node });
+}
+
 /**
  * Applies or removes the system proxy on a connection that is already up.
  * Returns whether it is now applied.

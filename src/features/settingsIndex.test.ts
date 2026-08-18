@@ -46,3 +46,13 @@ test("no two entries share a label", () => {
   const labels = SETTINGS.map((entry) => entry.label);
   assert.equal(new Set(labels).size, labels.length);
 });
+
+test("the exit chain is reachable by the words people would use for it", () => {
+  const top = (query: string) => searchSettings(query)[0]?.label;
+  assert.equal(top("chain"), "Route through a second hop");
+  assert.equal(top("subscription"), "Subscriptions");
+  assert.equal(top("vless"), "Configs pasted by hand");
+  // The complaint that started this feature, in the words it was reported in.
+  assert.ok(searchSettings("change ip").length > 0);
+  assert.ok(searchSettings("country").length > 0);
+});

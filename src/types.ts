@@ -9,6 +9,21 @@ export const ENDPOINT_MODES: Array<{ id: EndpointMode; label: string; detail: st
   { id: "custom-only", label: "Custom only", detail: "Use the pinned address or fail." },
 ];
 
+/** A subscription or pasted-config source feeding the chain. */
+export interface ChainSource {
+  name: string;
+  url: string;
+  enabled: boolean;
+}
+
+export interface ChainSettings {
+  enabled: boolean;
+  sources: ChainSource[];
+  /** Config URIs pasted by hand, one per line. mihomo converts these itself. */
+  manual: string;
+  node: string | null;
+}
+
 export interface ConnectionProfile {
   name: string;
   protocol: "masque" | "wg" | "gool";
@@ -51,6 +66,8 @@ export interface ConnectionProfile {
   systemProxy: boolean;
   /** Keep retrying after a route drops, rather than leaving it dead. */
   autoReconnect: boolean;
+  /** The second hop that changes the exit address. Off unless configured. */
+  chain: ChainSettings;
   /** Leave the system proxy on a dead tunnel so apps fail rather than leak. */
   killSwitch: boolean;
 }
@@ -128,6 +145,7 @@ export const DEFAULT_PROFILE: ConnectionProfile = {
   gateway: false,
   systemProxy: false,
   autoReconnect: true,
+  chain: { enabled: false, sources: [], manual: "", node: null },
   killSwitch: false,
 };
 

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  Activity, FileText, Globe, Route as RouteIcon, ShieldCheck, Wifi, type LucideIcon,
+  Activity, FileText, Globe, Link2, Route as RouteIcon, ShieldCheck, Wifi, type LucideIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -12,19 +12,21 @@ import { endpointError, normalizeEndpoint } from "@/core/endpoint";
 import { REPORT_EVENT_LIMIT, buildReport, reportFilename } from "@/core/report";
 import { saveReport } from "@/core/api";
 import { NumberField, Row, RulesField, Seg, TextField } from "./panels";
+import { Chain } from "./Chain";
 import { Scanner } from "./Scanner";
 import { transportName } from "./Simple";
 import {
   ENDPOINT_MODES, type ConnectionProfile, type CoreLogEvent, type CoreProbe, type CoreSnapshot,
 } from "@/types";
 
-type SectionId = "status" | "routes" | "endpoint" | "traffic" | "identity" | "diagnostics";
+type SectionId = "status" | "routes" | "endpoint" | "chain" | "traffic" | "identity" | "diagnostics";
 
 const SECTIONS: Array<{ group: string; items: Array<{ id: SectionId; label: string; icon: LucideIcon }> }> = [
   { group: "Connection", items: [
     { id: "status", label: "Status", icon: Activity },
     { id: "routes", label: "Routes & transports", icon: RouteIcon },
     { id: "endpoint", label: "Endpoint", icon: Globe },
+    { id: "chain", label: "Exit chain", icon: Link2 },
   ] },
   { group: "System", items: [
     { id: "traffic", label: "Traffic & DNS", icon: Wifi },
@@ -37,6 +39,7 @@ const BLURB: Record<SectionId, string> = {
   status: "What the core is doing right now.",
   routes: "How hard to search, what the tunnel rides on, and how it hides.",
   endpoint: "Pin a specific gateway, or let the core find one.",
+  chain: "Send the tunnel's traffic on through a node of your own, so the address you appear from changes.",
   traffic: "Where traffic goes once the tunnel is up.",
   identity: "Cloudflare Zero Trust enrolment.",
   diagnostics: "The core executable, logging, and a report you can hand to someone.",
@@ -116,6 +119,14 @@ export function Advanced(props: AdvancedProps) {
         {section === "status" && <Status {...props} />}
         {section === "routes" && <Routes {...props} />}
         {section === "endpoint" && <Endpoint {...props} />}
+        {section === "chain" && (
+          <Chain
+            profile={props.profile}
+            onChange={props.onChange}
+            connected={props.snapshot.state === "connected"}
+            onToast={props.onToast}
+          />
+        )}
         {section === "traffic" && <Traffic {...props} />}
         {section === "identity" && <Identity {...props} />}
         {section === "diagnostics" && <Diagnostics {...props} />}

@@ -6,7 +6,7 @@
  * will not search for "Reach", and someone who wants to stop DNS leaking will
  * not know the setting is called "Resolvers".
  */
-export type SectionId = "status" | "routes" | "endpoint" | "traffic" | "identity" | "diagnostics";
+export type SectionId = "status" | "routes" | "endpoint" | "chain" | "traffic" | "identity" | "diagnostics";
 
 export interface SettingEntry {
   label: string;
@@ -21,6 +21,7 @@ export const SECTION_LABELS: Record<SectionId, string> = {
   status: "Status",
   routes: "Routes & transports",
   endpoint: "Endpoint",
+  chain: "Exit chain",
   traffic: "Traffic & DNS",
   identity: "Identity",
   diagnostics: "Diagnostics",
@@ -50,6 +51,11 @@ export const SETTINGS: SettingEntry[] = [
   { label: "How the gateway is chosen", section: "endpoint", where: "Endpoint", keywords: "automatic custom first custom only endpoint mode" },
   { label: "Per-protocol overrides", section: "endpoint", where: "Endpoint", keywords: "h2 peer wireguard peer separate address" },
 
+  { label: "Route through a second hop", section: "chain", where: "Exit chain", keywords: "chain proxy exit country change ip location second hop mihomo geo" },
+  { label: "Subscriptions", section: "chain", where: "Exit chain", keywords: "sub subscription link config nodes servers add" },
+  { label: "Configs pasted by hand", section: "chain", where: "Exit chain", keywords: "vless vmess trojan shadowsocks ss hysteria tuic paste uri manual config" },
+  { label: "Nodes", section: "chain", where: "Exit chain", keywords: "node ping delay speed test which server pick select" },
+
   { label: "Set the system proxy while connected", section: "traffic", where: "Traffic & DNS", keywords: "whole machine system proxy windows wininet browser all apps" },
   { label: "Block traffic if the tunnel drops", section: "traffic", where: "Traffic & DNS", keywords: "kill switch killswitch fail closed leak protection block traffic drop" },
   { label: "Keep me connected", section: "traffic", where: "Traffic & DNS", keywords: "auto reconnect retry keep alive stay connected reconnection" },
@@ -77,16 +83,21 @@ export function searchSettings(query: string, limit = 8): SettingEntry[] {
   const needle = query.trim().toLowerCase();
   if (!needle) return SETTINGS.slice(0, limit);
 
-  const scored = SETTINGS.map((entry) => {
+  const scored = SETTINGS.map((entry, order) => {
     const label = entry.label.toLowerCase();
     let score = 0;
     if (label.startsWith(needle)) score = 100;
     else if (label.includes(needle)) score = 70;
     else if (entry.where.toLowerCase().includes(needle)) score = 40;
     else if (entry.keywords.includes(needle)) score = 30;
-    return { entry, score };
+    return { entry, score, order };
   }).filter((candidate) => candidate.score > 0);
 
-  scored.sort((a, b) => b.score - a.score || a.entry.label.localeCompare(b.entry.label));
+  // Ties break on the order these are written in, not alphabetically. Searching
+  // a section name matches every setting in it equally, and the one worth
+  // offering first is the control the section exists for -- which is the one
+  // listed first. Sorting by label instead handed back whichever happened to
+  // start with the earliest letter.
+  scored.sort((a, b) => b.score - a.score || a.order - b.order);
   return scored.slice(0, limit).map((candidate) => candidate.entry);
 }
