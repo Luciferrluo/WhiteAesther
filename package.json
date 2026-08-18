@@ -11,8 +11,9 @@
     "test": "node --test \"src/**/*.test.ts\"",
     "preview": "vite preview",
     "stage:core": "node scripts/stage-core.mjs",
-    "desktop:dev": "pnpm stage:core && tauri dev",
-    "desktop:build": "pnpm stage:core && tauri build",
+    "stage:chain": "node scripts/stage-chain.mjs",
+    "desktop:dev": "pnpm stage:core && pnpm stage:chain && tauri dev",
+    "desktop:build": "pnpm stage:core && pnpm stage:chain && tauri build",
     "tauri": "tauri"
   },
   "dependencies": {

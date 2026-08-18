@@ -28,7 +28,8 @@
     "active": true,
     "targets": "all",
     "externalBin": [
-      "binaries/aether"
+      "binaries/aether",
+      "binaries/mihomo"
     ],
     "icon": [
       "icons/32x32.png",

@@ -224,6 +224,11 @@ jobs:
       - name: Stage the target-specific Aether sidecar
         run: pnpm stage:core -- --source "${{ github.workspace }}/aether-core/aether/target/release/${{ matrix.core }}"
 
+      # A released binary rather than something we build, pinned in the script
+      # so a release cannot pick up whatever upstream published that morning.
+      - name: Stage the chain engine
+        run: pnpm stage:chain
+
       - name: Test the Tauri backend
         run: cargo test --release --locked --manifest-path src-tauri/Cargo.toml
 
