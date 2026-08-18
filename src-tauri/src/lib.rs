@@ -147,6 +147,7 @@ pub fn run() {
             scanner::cancel_scan,
             latency::probe_latency,
             latency::speed_test,
+            latency::exit_info,
         ])
         .build(tauri::generate_context!())
         .expect("error while running WhiteAesther")

@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
-import { Check, FileText, Gauge, Lock, Plug, Power, Radar, Search, ShieldAlert, X, Zap, type LucideIcon } from "lucide-react";
+import { Check, FileText, Gauge, Globe, Lock, Plug, Power, Radar, Search, ShieldAlert, X, Zap, type LucideIcon } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
-import { speedTest } from "@/core/api";
+import { type ExitInfo, exitInfo, speedTest } from "@/core/api";
 import { ConnectOrb, type OrbState } from "./ConnectOrb";
 import { Sparkline } from "./Sparkline";
 import { type Sample, summarise } from "./latency";
@@ -235,6 +235,8 @@ function Connected({ snapshot, profile, latency, onProfile }: SimpleProps) {
         </div>
       </Card>
 
+      <ExitCard />
+
       <Card className="surface flex items-center gap-3.5 p-3">
         <Toggle
           icon={Plug}
@@ -257,6 +259,66 @@ function Connected({ snapshot, profile, latency, onProfile }: SimpleProps) {
         />
       </Card>
     </>
+  );
+}
+
+/**
+ * The address the rest of the internet sees.
+ *
+ * The Edge tile shows which Cloudflare gateway the tunnel connects *to*, which
+ * people read as the address they appear *from* -- they are not the same, and
+ * WARP is explicit that it does not move you to another country. Showing the
+ * real exit address settles that question instead of leaving it to guesswork.
+ */
+function ExitCard() {
+  const [info, setInfo] = useState<ExitInfo | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    setInfo(null);
+    setError(null);
+    void exitInfo()
+      .then((next) => { if (!disposed) setInfo(next); })
+      .catch((reason) => {
+        if (!disposed) setError(reason instanceof Error ? reason.message : String(reason));
+      });
+    return () => { disposed = true; };
+  }, []);
+
+  return (
+    <Card className="surface flex items-center gap-3.5 p-3.5">
+      <div
+        className={[
+          "grid size-[34px] shrink-0 place-items-center rounded-lg",
+          info?.warp ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground",
+        ].join(" ")}
+      >
+        <Globe className="size-[17px]" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="text-[12.5px] font-semibold">What websites see</div>
+        <div className="mt-0.5 truncate text-[11.5px] text-muted-foreground">
+          {error
+            ? error
+            : info
+              ? `${info.ip} · ${info.country}${info.colo ? ` · via ${info.colo}` : ""}`
+              : "Checking…"}
+        </div>
+      </div>
+      {info ? (
+        <span
+          className={[
+            "shrink-0 rounded-md border px-2 py-1 text-[11px] font-semibold",
+            info.warp
+              ? "border-primary/30 bg-primary/[0.11] text-primary"
+              : "border-warning/40 bg-warning/[0.11] text-warning",
+          ].join(" ")}
+        >
+          {info.warp ? "Through the tunnel" : "Not through the tunnel"}
+        </span>
+      ) : null}
+    </Card>
   );
 }
 

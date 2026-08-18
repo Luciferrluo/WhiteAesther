@@ -129,6 +129,23 @@ export async function speedTest(): Promise<SpeedResult> {
   return invoke("speed_test");
 }
 
+export interface ExitInfo {
+  /** The address a website logs for this connection. */
+  ip: string;
+  /** Two-letter country as Cloudflare geolocates that address. */
+  country: string;
+  colo: string;
+  /** False means the request went around the tunnel rather than through it. */
+  warp: boolean;
+  gateway: boolean;
+}
+
+/** Reads the exit address and country from inside the tunnel. */
+export async function exitInfo(): Promise<ExitInfo> {
+  requireDesktop();
+  return invoke("exit_info");
+}
+
 /**
  * Applies or removes the system proxy on a connection that is already up.
  * Returns whether it is now applied.
