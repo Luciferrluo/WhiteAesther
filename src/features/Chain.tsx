@@ -9,7 +9,7 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { Row } from "./panels";
 import {
-  type ChainNode, chainNodes, chainSelect, chainStatus, chainTest,
+  type ChainNode, chainNodes, chainSelect, chainStatus, chainTest, setChain,
 } from "@/core/api";
 import type { ChainSource, ConnectionProfile } from "@/types";
 
@@ -22,13 +22,18 @@ interface ChainProps {
 
 export function Chain({ profile, onChange, connected, onToast }: ChainProps) {
   const chain = profile.chain;
-  const set = (patch: Partial<ConnectionProfile["chain"]>) =>
-    onChange({ ...profile, chain: { ...chain, ...patch } });
 
   const [running, setRunning] = useState(false);
   const [address, setAddress] = useState<string | null>(null);
   const [nodes, setNodes] = useState<ChainNode[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
+  const [applying, setApplying] = useState(false);
+  /**
+   * Kept on screen rather than shown as a toast. A chain that failed to start
+   * leaves the switch on and the node list empty, and a message that has
+   * already faded is no help at all to whoever is looking at that.
+   */
+  const [failure, setFailure] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -36,16 +41,43 @@ export function Chain({ profile, onChange, connected, onToast }: ChainProps) {
       setRunning(status.running);
       setAddress(status.address);
       setNodes(status.running ? await chainNodes() : []);
-    } catch {
-      // Not running is the ordinary case, not a failure worth a toast.
+    } catch (error) {
+      // Not running is ordinary; being unable to ask is not. Swallowing this
+      // made a failed status read indistinguishable from a stopped chain.
       setRunning(false);
       setNodes([]);
+      setFailure(error instanceof Error ? error.message : String(error));
     }
   }, []);
 
   useEffect(() => {
     void refresh();
   }, [refresh, connected]);
+
+  /**
+   * Saves a change and makes it take effect now.
+   *
+   * mihomo reads its sources once at startup, so a new subscription or a
+   * flipped switch means nothing until it is restarted -- and doing that only
+   * at the next connect is what made this screen look broken while the user
+   * was already connected.
+   */
+  const apply = async (patch: Partial<ConnectionProfile["chain"]>) => {
+    const next = { ...chain, ...patch };
+    onChange({ ...profile, chain: next });
+    setApplying(true);
+    setFailure(null);
+    try {
+      await setChain(next);
+      await refresh();
+    } catch (error) {
+      setFailure(error instanceof Error ? error.message : String(error));
+      await refresh();
+    } finally {
+      setApplying(false);
+    }
+  };
+  const set = (patch: Partial<ConnectionProfile["chain"]>) => void apply(patch);
 
   return (
     <>
@@ -67,22 +99,55 @@ export function Chain({ profile, onChange, connected, onToast }: ChainProps) {
           </Row>
           {chain.enabled ? (
             <>
-              <Separator />
-              <div className="flex items-center gap-2.5 py-3">
-                <span
-                  className={[
-                    "size-1.5 shrink-0 rounded-full",
-                    running ? "bg-primary" : connected ? "bg-warning" : "bg-muted-foreground",
-                  ].join(" ")}
+              <Row
+                title="Dial nodes through the tunnel"
+                help={
+                  chain.throughTunnel
+                    ? "This network sees only Cloudflare, never your node's address. Needs the tunnel connected."
+                    : "Your node is reached directly, so this network can see its address. Use when the tunnel will not connect."
+                }
+              >
+                <Switch
+                  checked={chain.throughTunnel}
+                  onCheckedChange={(throughTunnel) => set({ throughTunnel })}
                 />
-                <span className="text-[13px] text-muted-foreground">
-                  {running
-                    ? `Carrying traffic on ${address}`
-                    : connected
-                      ? "The tunnel is up but the chain is not running — check the log."
-                      : "Starts once the tunnel is connected."}
-                </span>
+              </Row>
+              <Separator />
+              <div className="flex items-center justify-between gap-4 py-3">
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <span
+                    className={[
+                      "size-1.5 shrink-0 rounded-full",
+                      running ? "bg-primary" : connected ? "bg-destructive" : "bg-muted-foreground",
+                    ].join(" ")}
+                  />
+                  <span className="text-[13px] text-muted-foreground">
+                    {applying
+                      ? "Starting…"
+                      : running
+                        ? `Carrying traffic on ${address}`
+                        : connected
+                          ? "Switched on, but not running."
+                          : chain.throughTunnel
+                            ? "Waiting for the tunnel. Turn off the switch above to run without it."
+                            : "Switched on, but not running."}
+                  </span>
+                </div>
+                {(connected || !chain.throughTunnel) && !running && !applying ? (
+                  <Button variant="outline" size="sm" className="shrink-0" onClick={() => set({})}>
+                    <RefreshCw />
+                    Start now
+                  </Button>
+                ) : null}
               </div>
+              {failure ? (
+                <div className="mb-3 rounded-lg border border-destructive/40 bg-destructive/[0.08] p-3">
+                  <div className="text-[12.5px] font-semibold text-destructive">
+                    The chain did not start
+                  </div>
+                  <div className="mt-1 break-words text-[12px] text-muted-foreground">{failure}</div>
+                </div>
+              ) : null}
             </>
           ) : null}
         </CardContent>
@@ -104,14 +169,34 @@ export function Chain({ profile, onChange, connected, onToast }: ChainProps) {
             className="font-mono text-[12.5px]"
             value={chain.manual}
             placeholder={"vless://…\ntrojan://…"}
-            onChange={(event) => set({ manual: event.target.value })}
+            // Typed into freely; applied on the button below. Restarting the
+            // chain on every keystroke would tear the connection down
+            // repeatedly while someone is still pasting.
+            onChange={(event) =>
+              onChange({ ...profile, chain: { ...chain, manual: event.target.value } })
+            }
           />
+          <div className="mt-3 flex items-center justify-between gap-4">
+            <p className="text-[12px] text-muted-foreground">
+              Read when the chain starts, so they take effect once applied.
+            </p>
+            <Button variant="outline" size="sm" disabled={applying} onClick={() => set({})}>
+              Apply
+            </Button>
+          </div>
         </CardContent>
       </Card>
 
       <Nodes
         nodes={nodes}
         running={running}
+        blocked={
+          !chain.enabled
+            ? "Turn on “Route through a second hop” above to load nodes."
+            : chain.throughTunnel && !connected
+              ? "Connect first, or turn off “Dial nodes through the tunnel”."
+              : "The chain did not start. The reason is shown above."
+        }
         selected={chain.node}
         busy={busy}
         onRefresh={refresh}
@@ -231,6 +316,7 @@ function Sources({
 function Nodes({
   nodes,
   running,
+  blocked,
   selected,
   busy,
   onRefresh,
@@ -239,6 +325,8 @@ function Nodes({
 }: {
   nodes: ChainNode[];
   running: boolean;
+  /** Why there is nothing to show, in terms of what to do about it. */
+  blocked: string;
   selected: string | null;
   busy: string | null;
   onRefresh: () => void;
@@ -262,12 +350,11 @@ function Nodes({
       </CardHeader>
       <CardContent className="pt-2">
         {!running ? (
-          <p className="py-6 text-center text-[13px] text-muted-foreground">
-            Connect with the chain switched on to load nodes.
-          </p>
+          <p className="py-6 text-center text-[13px] text-muted-foreground">{blocked}</p>
         ) : !nodes.length ? (
           <p className="py-6 text-center text-[13px] text-muted-foreground">
-            No nodes yet. Check that a subscription is enabled.
+            The chain is running but no nodes arrived — check that a subscription is enabled and
+            that its link is still valid.
           </p>
         ) : (
           <div className="flex flex-col">

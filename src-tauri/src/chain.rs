@@ -29,6 +29,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+use crate::core_supervisor::CoreSupervisor;
+
 /// The name the generated config gives the first hop. Referenced by every node
 /// through `dialer-proxy`, which is what puts them behind the tunnel.
 const TUNNEL_PROXY: &str = "aether";
@@ -61,6 +63,14 @@ pub struct ChainSource {
 #[serde(rename_all = "camelCase")]
 pub struct ChainSettings {
     pub enabled: bool,
+    /// Dial the nodes from inside the MASQUE tunnel.
+    ///
+    /// On by default, and worth keeping: it is what hides the node's address
+    /// and SNI from the local network. But it makes the chain impossible
+    /// whenever the tunnel cannot connect -- and on a network that resets
+    /// MASQUE, that is always -- so it can be turned off to reach the nodes
+    /// directly instead of reaching nothing at all.
+    pub through_tunnel: bool,
     /// Subscription URLs. Ours ships as the first entry; the user may add more.
     pub sources: Vec<ChainSource>,
     /// Config URIs pasted by hand, one per line. mihomo converts these itself,
@@ -73,7 +83,13 @@ pub struct ChainSettings {
 
 impl Default for ChainSettings {
     fn default() -> Self {
-        Self { enabled: false, sources: Vec::new(), manual: String::new(), node: None }
+        Self {
+            enabled: false,
+            through_tunnel: true,
+            sources: Vec::new(),
+            manual: String::new(),
+            node: None,
+        }
     }
 }
 
@@ -123,7 +139,7 @@ impl Chain {
     pub fn start(
         &self,
         app: &AppHandle,
-        tunnel: SocketAddr,
+        tunnel: Option<SocketAddr>,
         settings: &ChainSettings,
     ) -> Result<SocketAddr, String> {
         self.stop();
@@ -136,6 +152,9 @@ impl Chain {
         if usable.is_empty() && settings.manual.trim().is_empty() {
             return Err("add a subscription or a config before turning the chain on".into());
         }
+        if settings.through_tunnel && tunnel.is_none() {
+            return Err("connect first, or turn off \"dial nodes through the tunnel\"".into());
+        }
 
         let binary = locate(app)?;
         let home = app
@@ -146,7 +165,12 @@ impl Chain {
         std::fs::create_dir_all(home.join("providers"))
             .map_err(|error| format!("cannot prepare the chain directory: {error}"))?;
 
-        let mixed = free_port()?;
+        // The mixed port is an address a person types into a browser, so it has
+        // to be the same one tomorrow. An ephemeral port meant every launch
+        // moved it, and anything configured against the last run quietly went
+        // out past the hop with the old exit address.
+        let mixed = preferred_port(tunnel.map_or(DEFAULT_MIXED_PORT, next_port))?;
+        // The API stays ephemeral: only this process ever speaks to it.
         let api = free_port()?;
         let secret = secret();
 
@@ -179,6 +203,36 @@ impl Chain {
         let mut child = command
             .spawn()
             .map_err(|error| format!("cannot start the chain: {error}"))?;
+
+        // Piped and never read is a process that blocks on its own logging once
+        // the pipe fills. It also threw away the only account of what the chain
+        // was doing: mihomo marks every node dead when the tunnel underneath
+        // slows down, and none of that reached anyone.
+        for (reader, name) in [
+            (child.stdout.take().map(|out| Box::new(out) as Box<dyn Read + Send>), "chain"),
+            (child.stderr.take().map(|err| Box::new(err) as Box<dyn Read + Send>), "chain"),
+        ] {
+            let Some(reader) = reader else {
+                continue;
+            };
+            let app = app.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(reader).lines().map_while(Result::ok) {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let level = if line.contains("level=error") {
+                        "error"
+                    } else if line.contains("level=warning") {
+                        "warn"
+                    } else {
+                        "info"
+                    };
+                    app.state::<CoreSupervisor>().record(name, level, line.to_string());
+                }
+            });
+        }
 
         let api_address = SocketAddr::from((Ipv4Addr::LOCALHOST, api));
         if let Err(error) = wait_until_ready(api_address, &secret) {
@@ -305,7 +359,7 @@ impl Drop for Chain {
 /// a subscription of any size arrive without us parsing or rewriting a single
 /// entry: every node it carries inherits the tunnel.
 fn render(
-    tunnel: SocketAddr,
+    tunnel: Option<SocketAddr>,
     mixed: u16,
     api: u16,
     secret: &str,
@@ -318,7 +372,10 @@ fn render(
     // web page the user opens could drive this API and reroute their traffic.
     config.push_str(&format!("external-controller: 127.0.0.1:{api}\n"));
     config.push_str(&format!("secret: {}\n", serde_json::to_string(secret).unwrap_or_default()));
-    config.push_str("mode: rule\nlog-level: warning\nipv6: true\n");
+    // info, not warning: a node list where every entry reads dead is explained
+    // by the health-check lines, and those are info. They cost a few lines a
+    // minute and now go to the app log rather than an undrained pipe.
+    config.push_str("mode: rule\nlog-level: info\nipv6: true\n");
 
     // Resolvers live inside the chain. A query that escapes to the local
     // network names the destination even when the traffic itself does not.
@@ -328,11 +385,19 @@ fn render(
          - https://dns.google/dns-query\n",
     );
 
-    config.push_str(&format!(
-        "proxies:\n  - {{name: {TUNNEL_PROXY}, type: socks5, server: {}, port: {}, udp: true}}\n",
-        tunnel.ip(),
-        tunnel.port()
-    ));
+    // Declared only when there is a tunnel to declare. A socks5 proxy pointing
+    // at a port nothing is listening on would fail every node it fronted.
+    let through = match tunnel {
+        Some(address) => {
+            config.push_str(&format!(
+                "proxies:\n  - {{name: {TUNNEL_PROXY}, type: socks5, server: {}, port: {}, udp: true}}\n",
+                address.ip(),
+                address.port()
+            ));
+            format!("\n    dialer-proxy: {TUNNEL_PROXY}")
+        }
+        None => String::new(),
+    };
 
     let mut names: Vec<String> = Vec::new();
     if !sources.is_empty() || !manual.trim().is_empty() {
@@ -343,7 +408,7 @@ fn render(
         names.push(key.clone());
         config.push_str(&format!(
             "  {key}:\n    type: http\n    url: {}\n    interval: 3600\n    \
-             path: ./providers/{key}.yaml\n    dialer-proxy: {TUNNEL_PROXY}\n    \
+             path: ./providers/{key}.yaml{through}\n    \
              health-check: {{enable: true, url: \"http://www.gstatic.com/generate_204\", \
              interval: 300, lazy: true}}\n",
             serde_json::to_string(&source.url).unwrap_or_default()
@@ -352,8 +417,8 @@ fn render(
     if !manual.trim().is_empty() {
         names.push(MANUAL_PROVIDER.into());
         config.push_str(&format!(
-            "  {MANUAL_PROVIDER}:\n    type: file\n    path: ./providers/manual.txt\n    \
-             dialer-proxy: {TUNNEL_PROXY}\n    health-check: {{enable: true, \
+            "  {MANUAL_PROVIDER}:\n    type: file\n    path: ./providers/manual.txt{through}\n    \
+             health-check: {{enable: true, \
              url: \"http://www.gstatic.com/generate_204\", interval: 300, lazy: true}}\n"
         ));
     }
@@ -397,6 +462,28 @@ fn locate(app: &AppHandle) -> Result<PathBuf, String> {
 /// There is a gap between letting go of the port and mihomo binding it. Nothing
 /// on a desktop is racing for a random high port, and the alternative -- fixed
 /// ports -- collides with whatever else the machine is already running.
+/// The mixed port used when there is no tunnel to derive one from.
+const DEFAULT_MIXED_PORT: u16 = 1820;
+
+/// One above the tunnel's own port, so the two read as a pair.
+fn next_port(tunnel: SocketAddr) -> u16 {
+    tunnel.port().checked_add(1).unwrap_or(DEFAULT_MIXED_PORT)
+}
+
+/// Takes `want` when it is free, and any free port when it is not.
+///
+/// Falling back rather than failing matters: something else holding one port is
+/// a reason to move, not a reason to leave the user without a second hop.
+fn preferred_port(want: u16) -> Result<u16, String> {
+    match TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, want))) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(want)
+        }
+        Err(_) => free_port(),
+    }
+}
+
 fn free_port() -> Result<u16, String> {
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .map_err(|error| format!("no free local port: {error}"))?;
@@ -488,6 +575,14 @@ fn request(
         .and_then(|value| value.parse::<u16>().ok())
         .ok_or("the chain gave an unreadable reply")?;
 
+    // Go sets Content-Length only for a reply small enough to buffer, and
+    // frames the rest in chunks. That is why this went unnoticed for so long:
+    // /version is 35 bytes and arrives whole, so the readiness check passed and
+    // the chain reported itself up, while the node list -- the one reply that is
+    // always large -- reached the JSON parser with its chunk header still on the
+    // front. "expected value at line 1 column 1" reads like the chain crashed,
+    // not like a reply we never finished reading.
+    let mut chunked = false;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
@@ -496,15 +591,66 @@ fn request(
         if line == "\r\n" || line == "\n" {
             break;
         }
+        let lowered = line.to_ascii_lowercase();
+        if let Some(value) = lowered.strip_prefix("transfer-encoding:") {
+            chunked = value.contains("chunked");
+        }
     }
-    let mut rest = String::new();
-    let _ = reader.read_to_string(&mut rest);
+    let rest = if chunked {
+        read_chunked(&mut reader)?
+    } else {
+        let mut body = String::new();
+        let _ = reader.read_to_string(&mut body);
+        body
+    };
 
     if !(200..300).contains(&code) {
         return Err(format!("the chain refused that request ({code})"));
     }
     Ok(rest)
 }
+
+/// Reassembles a chunked body.
+///
+/// Only what reading one requires: sizes are hex, may carry a `;extension`
+/// this ignores, and a zero-length chunk ends the body. Trailers after it are
+/// left unread, because the connection is closing anyway.
+fn read_chunked<R: BufRead>(reader: &mut R) -> Result<String, String> {
+    let mut body = Vec::new();
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).map_err(|e| e.to_string())? == 0 {
+            break;
+        }
+        let size = header.trim().split(';').next().unwrap_or_default();
+        if size.is_empty() {
+            continue;
+        }
+        let size = usize::from_str_radix(size, 16)
+            .map_err(|_| "the chain framed its reply in a way we cannot read".to_string())?;
+        if size == 0 {
+            break;
+        }
+        // The length is the peer's word, not ours, and this reply is a node
+        // list rather than a download.
+        if body.len() + size > MAX_BODY {
+            return Err("the chain sent more than we are willing to hold".into());
+        }
+        let mut chunk = vec![0u8; size];
+        reader
+            .read_exact(&mut chunk)
+            .map_err(|error| format!("the chain stopped mid-reply: {error}"))?;
+        body.extend_from_slice(&chunk);
+        // The line break that closes the chunk.
+        let mut terminator = String::new();
+        let _ = reader.read_line(&mut terminator);
+    }
+    String::from_utf8(body).map_err(|_| "the chain sent something that is not text".into())
+}
+
+/// Eight megabytes: far beyond any node list, far below anything that matters
+/// to a desktop.
+const MAX_BODY: usize = 8 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -514,8 +660,8 @@ mod tests {
         ChainSource { name: name.into(), url: url.into(), enabled: true }
     }
 
-    fn tunnel() -> SocketAddr {
-        "127.0.0.1:1819".parse().unwrap()
+    fn tunnel() -> Option<SocketAddr> {
+        Some("127.0.0.1:1819".parse().unwrap())
     }
 
     #[test]
@@ -568,6 +714,22 @@ mod tests {
     }
 
     #[test]
+    fn without_a_tunnel_the_nodes_are_reached_directly() {
+        // The whole point of the fallback: on a network that resets MASQUE the
+        // tunnel never comes up, and a config that still insisted on dialling
+        // through it would leave the user with nothing working at all.
+        let config = render(None, 1820, 1821, "s", &[], "vless://x");
+        assert!(!config.contains("dialer-proxy"), "nothing to dial through");
+        assert!(
+            !config.contains("type: socks5"),
+            "a socks5 proxy pointing at a dead port would fail every node it fronted",
+        );
+        // Everything else must still hold: no direct rule, DNS inside the chain.
+        assert!(config.contains("MATCH,exit"));
+        assert!(config.contains("enhanced-mode: fake-ip"));
+    }
+
+    #[test]
     fn a_secret_differs_between_runs() {
         assert_ne!(secret(), secret());
     }
@@ -580,5 +742,38 @@ mod tests {
         assert_eq!(encode("xhttp-tls -cdn"), "xhttp-tls%20-cdn");
         assert_eq!(encode("safe-._~"), "safe-._~");
         assert!(encode("🇯🇵 tokyo").starts_with('%'));
+    }
+
+    #[test]
+    fn a_chunked_reply_is_reassembled() {
+        // The shape mihomo actually sends a node list in: a hex size, the
+        // bytes, then a zero chunk. Before this was read, that size line went
+        // to the JSON parser and every node list looked like a crash.
+        let wire = "5\r\nhello\r\n2\r\n!!\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(wire.as_bytes());
+        assert_eq!(read_chunked(&mut reader).unwrap(), "hello!!");
+    }
+
+    #[test]
+    fn a_chunk_larger_than_we_will_hold_is_refused() {
+        let wire = format!("{:x}\r\n", MAX_BODY + 1);
+        let mut reader = BufReader::new(wire.as_bytes());
+        assert!(read_chunked(&mut reader).is_err());
+    }
+
+    #[test]
+    fn the_mixed_port_sits_next_to_the_tunnel() {
+        // A person configures this one in a browser, so it has to be derivable
+        // and the same on the next launch rather than whatever was free.
+        assert_eq!(next_port("127.0.0.1:1819".parse().unwrap()), 1820);
+        assert_eq!(next_port("127.0.0.1:65535".parse().unwrap()), DEFAULT_MIXED_PORT);
+    }
+
+    #[test]
+    fn a_taken_port_moves_rather_than_failing() {
+        let held = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let taken = held.local_addr().unwrap().port();
+        let chosen = preferred_port(taken).unwrap();
+        assert_ne!(chosen, taken);
     }
 }

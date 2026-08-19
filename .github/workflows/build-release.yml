@@ -174,8 +174,26 @@ jobs:
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
+        # Twice in a row this sat here for over half an hour on x86_64 while
+        # every other architecture -- including the arm runner on the same image
+        # -- finished, and a release waited on an apt mirror that had stopped
+        # answering. apt retries without a deadline by default, so the job never
+        # failed and never finished, which is the worst of both.
+        #
+        # Bound the wait and make the failure loud: ten minutes is far longer
+        # than this step has ever legitimately needed, and a re-run of one job
+        # costs minutes where a hang costs the whole cycle.
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          # needrestart asks which services to restart, on a terminal nobody is
+          # watching. "a" answers it.
+          NEEDRESTART_MODE: a
         run: >-
-          sudo apt-get update && sudo apt-get install -y
+          sudo -E apt-get update
+          -o Acquire::Retries=3 -o Acquire::http::Timeout=20 &&
+          sudo -E apt-get install -y
+          -o Acquire::Retries=3 -o Acquire::http::Timeout=20
           libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev
           libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
           cmake ninja-build perl pkg-config clang rpm xdg-utils

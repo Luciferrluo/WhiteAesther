@@ -76,7 +76,7 @@ export default function App() {
         // too, leaving the app blind to a running core for the whole session.
         unsubscribe = await subscribeCore(
           (next) => { if (!disposed) setSnapshot(next); },
-          (entry) => { if (!disposed) setLogs((current) => [...current.slice(-999), entry]); },
+          (batch) => { if (!disposed) setLogs((current) => [...current, ...batch].slice(-1000)); },
         );
         if (disposed) return;
         const [info, saved, current, history] = await Promise.allSettled([runtimeInfo(), loadProfile(), getCoreStatus(), getCoreLogs()]);

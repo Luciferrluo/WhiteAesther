@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -408,6 +408,16 @@ struct SupervisorInner {
     /// The local HTTP proxy the system proxy points at. Only alive while the
     /// system proxy is applied, and dropped with it.
     bridge: Mutex<Option<HttpBridge>>,
+    /// Log lines waiting to be handed to the window.
+    ///
+    /// The thread reading the core's stdout is the only thing draining a 64KB
+    /// pipe: if it stops to emit an IPC message per line, a busy window becomes
+    /// backpressure and the core blocks mid-scan on its own logging. Nothing on
+    /// the reading side may wait on the interface, so lines land here and a
+    /// separate pump delivers them.
+    pending: Mutex<Vec<CoreLogEvent>>,
+    /// Set when the snapshot has changed since the pump last sent it.
+    snapshot_dirty: AtomicBool,
 }
 
 impl SupervisorInner {
@@ -433,6 +443,8 @@ impl CoreSupervisor {
                 proxy_applied: AtomicBool::new(false),
                 scan_child: Mutex::new(None),
                 bridge: Mutex::new(None),
+                pending: Mutex::new(Vec::new()),
+                snapshot_dirty: AtomicBool::new(false),
             }),
         }
     }
@@ -445,6 +457,15 @@ impl CoreSupervisor {
     pub fn connected_socks(&self) -> Option<String> {
         let snapshot = lock(&self.inner.snapshot);
         (snapshot.state == "connected").then(|| snapshot.socks_address.clone())
+    }
+
+    /// Records a line from something the app runs alongside the core.
+    ///
+    /// The chain uses this for mihomo's output. Anything with a piped stream
+    /// must have it drained by somebody, or the process blocks on its own
+    /// logging once the pipe fills -- and its diagnosis is lost either way.
+    pub fn record(&self, stream: &str, level: &str, message: String) {
+        push_log(&self.inner, stream, level, message);
     }
 
     /// Refuses when a connection is live: a scan competes with it for the same
@@ -695,9 +716,9 @@ fn launch(
             max_attempts: MAX_ATTEMPTS,
             blocking: false,
         };
-        emit_snapshot(app, &snapshot);
+        mark_snapshot_dirty(inner);
     }
-    supervisor_log(app, inner, "info", session_summary(profile, attempt));
+    supervisor_log(inner, "info", session_summary(profile, attempt));
 
     if let Some(stdout) = stdout {
         spawn_log_reader(app.clone(), inner.clone(), stdout, "stdout");
@@ -706,6 +727,7 @@ fn launch(
         spawn_log_reader(app.clone(), inner.clone(), stderr, "stderr");
     }
     spawn_exit_monitor(app.clone(), inner.clone(), generation);
+    spawn_route_watch(app.clone(), inner.clone(), generation);
 
     Ok(())
 }
@@ -758,6 +780,72 @@ pub fn set_system_proxy(
     }
     apply_system_proxy(&app, inner, &socks);
     Ok(inner.proxy_applied.load(Ordering::SeqCst))
+}
+
+/// Turns the chain on or off on a connection that is already up.
+///
+/// Without this the switch only took effect at the next connect, which is the
+/// same fault the system proxy toggle had: the screen offers the choice while
+/// connected, so it has to mean something then. Changing a subscription goes
+/// through here too, because mihomo reads its sources at startup and would
+/// otherwise keep serving the old list.
+#[tauri::command]
+pub async fn set_chain(
+    app: AppHandle,
+    supervisor: State<'_, CoreSupervisor>,
+    chain: State<'_, Chain>,
+    settings: ChainSettings,
+) -> Result<bool, String> {
+    let inner = &supervisor.inner;
+
+    // Remember it for the rest of the session, so a reconnect keeps the choice.
+    if let Some(session) = lock(&inner.session).as_mut() {
+        session.profile.chain = settings.clone();
+    }
+
+    let socks = supervisor.connected_socks();
+    let tunnel = match socks.as_deref() {
+        Some(address) => Some(
+            address
+                .parse::<SocketAddr>()
+                .map_err(|_| format!("the proxy address {address} cannot be parsed"))?,
+        ),
+        None => None,
+    };
+    // Without a tunnel the chain can still carry traffic straight to the nodes.
+    // Refusing outright is what left this unusable on a network that resets
+    // MASQUE: the tunnel never came up, so the chain never ran, so nothing the
+    // user configured did anything at all.
+    if tunnel.is_none() && (!settings.enabled || settings.through_tunnel) {
+        chain.stop();
+        return Ok(false);
+    }
+
+    let started = if settings.enabled {
+        let address = chain.start(&app, tunnel, &settings)?;
+        supervisor_log(
+            inner,
+            "info",
+            format!("chain listening on {address}; every node dials through the tunnel"),
+        );
+        Some(address)
+    } else {
+        chain.stop();
+        None
+    };
+
+    // The proxy has to follow whichever listener is now carrying traffic.
+    // Leaving it pointed at the old one would send everything around the change
+    // the user just made.
+    if inner.proxy_applied.load(Ordering::SeqCst) {
+        clear_system_proxy(&app, inner);
+        match (started, socks.as_deref()) {
+            (Some(address), _) => apply_chain_proxy(&app, inner, address),
+            (None, Some(address)) => apply_system_proxy(&app, inner, address),
+            (None, None) => {}
+        }
+    }
+    Ok(started.is_some())
 }
 
 #[tauri::command]
@@ -938,6 +1026,129 @@ fn spawn_log_reader<R: Read + Send + 'static>(
     });
 }
 
+/// How long a round trip has to take before the route counts as unusable.
+///
+/// A good edge answers in about a tenth of a second from here; a degraded one
+/// was measured at three to ten. Two seconds is far outside ordinary variance
+/// and still well inside "the page has not loaded yet".
+const BAD_ROUTE_MS: f64 = 2_000.0;
+
+/// Consecutive bad samples before acting, at [`ROUTE_WATCH`] apart.
+///
+/// Three rather than one: a single slow probe is a hiccup, and reconnecting on
+/// every hiccup would be worse than the problem.
+const BAD_ROUTE_STREAK: u32 = 3;
+const ROUTE_WATCH: Duration = Duration::from_secs(10);
+
+/// Watches the route a live tunnel is actually giving, and re-scans when it is
+/// no longer worth having.
+///
+/// The engine caches the gateway that last worked and reuses it on the next
+/// connect, checking only that it still answers a handshake -- not that it is
+/// still fast. A Cloudflare edge that degrades therefore stays pinned for good,
+/// because every successful connect writes it back to the cache. Measured on
+/// one machine, one minute apart: the cached edge took 3 to 10 seconds to first
+/// byte and then timed out, while a freshly scanned one took 0.11 seconds.
+///
+/// Nothing in the app noticed, because a handshake through a congested tunnel is
+/// still quick -- so the status chart read healthy while no page would load.
+fn spawn_route_watch(app: AppHandle, inner: Arc<SupervisorInner>, generation: u64) {
+    thread::spawn(move || {
+        let mut streak = 0u32;
+        loop {
+            thread::sleep(ROUTE_WATCH);
+            if !inner.is_current(generation) {
+                return;
+            }
+            let (state, socks) = {
+                let snapshot = lock(&inner.snapshot);
+                (snapshot.state.clone(), snapshot.socks_address.clone())
+            };
+            // Only a live tunnel has a route to judge. Connecting and retrying
+            // are already someone else's problem.
+            if state != "connected" {
+                streak = 0;
+                continue;
+            }
+            let Ok(address) = socks.parse::<SocketAddr>() else {
+                return;
+            };
+            match crate::latency::round_trip_ms(address) {
+                Some(ms) if ms < BAD_ROUTE_MS => streak = 0,
+                _ => streak += 1,
+            }
+            if streak < BAD_ROUTE_STREAK {
+                continue;
+            }
+            if !inner.is_current(generation) {
+                return;
+            }
+            rescan_bad_route(&app, &inner, generation);
+            return;
+        }
+    });
+}
+
+/// Reconnects without the cached gateway, keeping everything else as it was.
+///
+/// The transport is deliberately left alone. Alternating H2 and H3 is the answer
+/// to a transport that cannot get through at all; here it plainly can, and the
+/// edge behind it is what went bad -- moving a working transport to one this
+/// network may block would trade a slow tunnel for no tunnel.
+///
+/// The retry budget is untouched for the same reason: this is not a failed
+/// attempt, it is a good connection being replaced with a better one.
+fn rescan_bad_route(app: &AppHandle, inner: &Arc<SupervisorInner>, generation: u64) {
+    let profile = {
+        let mut guard = lock(&inner.session);
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        if session.generation != generation {
+            return;
+        }
+        // For the rest of this session. A cache that has already served one bad
+        // gateway has not earned another chance before the next launch.
+        session.profile.quick_reconnect = false;
+        session.attempt = 0;
+        session.profile.clone()
+    };
+
+    supervisor_log(
+        inner,
+        "warn",
+        format!(
+            "this gateway has been slower than {}ms for {} checks in a row; searching for a \n             better one rather than staying on it",
+            BAD_ROUTE_MS as u64, BAD_ROUTE_STREAK
+        ),
+    );
+
+    // Same shape as an explicit reconnect: invalidate, stop, start. Bumping the
+    // generation first stops the old child's monitors from treating the kill
+    // below as a crash and racing this with a retry of their own.
+    let next = inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    app.state::<Chain>().stop();
+    if let Some(child) = lock(&inner.child).take().as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    // The proxy is re-applied when the new tunnel reports itself up; leaving it
+    // pointed at the old one would strand traffic in the gap.
+    clear_system_proxy(app, inner);
+
+    *lock(&inner.session) = Some(Session { generation: next, profile: profile.clone(), attempt: 0 });
+    {
+        let mut snapshot = lock(&inner.snapshot);
+        snapshot.state = "reconnecting".into();
+        snapshot.pid = None;
+        snapshot.status_message = Some("Finding a faster gateway".into());
+        mark_snapshot_dirty(inner);
+    }
+    if let Err(error) = launch(app, inner, &profile, 0, next) {
+        handle_exit(app, inner, next, error);
+    }
+}
+
 fn spawn_exit_monitor(app: AppHandle, inner: Arc<SupervisorInner>, generation: u64) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(350));
@@ -1053,14 +1264,14 @@ fn give_up(
         snapshot.status_message = None;
         snapshot.attempt = 0;
         snapshot.last_error = Some(summary);
-        emit_snapshot(app, &snapshot);
+        mark_snapshot_dirty(inner);
     }
     supervisor_log(
-        app,
         inner,
         "error",
         format!("gave up after {MAX_ATTEMPTS} attempts: {reason}"),
     );
+    app.state::<Chain>().stop();
 
     // The kill switch only bites here, on the failure path. An explicit stop and
     // a quit both restore unconditionally, so the machine can always be put back
@@ -1068,7 +1279,6 @@ fn give_up(
     // caught by the recovery pass at the next launch.
     if profile.kill_switch && inner.proxy_applied.load(Ordering::SeqCst) {
         supervisor_log(
-            app,
             inner,
             "warn",
             "the tunnel is down and the system proxy has been left pointing at it, so traffic \
@@ -1103,6 +1313,18 @@ fn handle_exit(app: &AppHandle, inner: &Arc<SupervisorInner>, generation: u64, r
         ExitDecision::Retry { attempt, profile } => (attempt, profile),
     };
 
+    // The tunnel this proxy points at is gone, and the bridge in front of it
+    // answers nothing. Left applied through the backoff and the next attempt,
+    // it takes the whole machine off the network for as long as the retry runs
+    // -- the browser fails, and the failure reads as "the app broke everything"
+    // rather than "one attempt did not come up".
+    //
+    // The kill switch is the one case where holding it is the point, and that
+    // path is `hold` below; an ordinary retry has to leave the machine usable.
+    if !base_profile.kill_switch {
+        clear_system_proxy(app, inner);
+    }
+
     let profile = profile_for_attempt(&base_profile, attempt);
     let delay = retry_delay(attempt);
     // A pinned address that quietly stops being used is the one substitution a
@@ -1131,11 +1353,10 @@ fn handle_exit(app: &AppHandle, inner: &Arc<SupervisorInner>, generation: u64, r
                 delay.as_secs()
             )
         });
-        emit_snapshot(app, &snapshot);
+        mark_snapshot_dirty(inner);
     }
     if fell_back {
         supervisor_log(
-            app,
             inner,
             "warn",
             format!(
@@ -1145,7 +1366,6 @@ fn handle_exit(app: &AppHandle, inner: &Arc<SupervisorInner>, generation: u64, r
         );
     }
     supervisor_log(
-        app,
         inner,
         "warn",
         format!(
@@ -1211,10 +1431,9 @@ fn hold(
             "{reason}. Traffic is being held rather than sent in the clear — the search continues \
              in the background, or disconnect to put your system proxy back."
         ));
-        emit_snapshot(app, &snapshot);
+        mark_snapshot_dirty(inner);
     }
     supervisor_log(
-        app,
         inner,
         "warn",
         format!("{reason}; holding traffic and retrying every {}s", HOLD_RETRY.as_secs()),
@@ -1282,7 +1501,7 @@ fn retry_delay(attempt: u32) -> Duration {
     Duration::from_secs((BASE_RETRY_SECS << shift).min(MAX_RETRY_SECS))
 }
 
-fn push_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, level: &str, message: String) {
+fn push_log(inner: &SupervisorInner, stream: &str, level: &str, message: String) {
     let event = CoreLogEvent {
         timestamp: now_millis(),
         stream: stream.into(),
@@ -1296,7 +1515,11 @@ fn push_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, level: &str,
         }
         logs.push_back(event.clone());
     }
-    let _ = app.emit("core-log", &event);
+    // Buffered, not emitted. The pump below delivers these in batches.
+    let mut pending = lock(&inner.pending);
+    if pending.len() < MAX_LOGS {
+        pending.push(event);
+    }
 }
 
 /// What the supervisor itself did, as opposed to what the core printed.
@@ -1304,13 +1527,13 @@ fn push_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, level: &str,
 /// Retries, give-ups and the configuration a session ran with leave no trace in
 /// the core's own output, so without these a diagnostics report cannot answer
 /// the question it was collected for.
-fn supervisor_log(app: &AppHandle, inner: &SupervisorInner, level: &str, message: String) {
-    push_log(app, inner, "supervisor", level, message);
+fn supervisor_log(inner: &SupervisorInner, level: &str, message: String) {
+    push_log(inner, "supervisor", level, message);
 }
 
 fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: String) {
     let message = message.trim().to_string();
-    push_log(app, inner, stream, log_level(&message), message.clone());
+    push_log(inner, stream, log_level(&message), message.clone());
 
     let connected = {
         let mut snapshot = lock(&inner.snapshot);
@@ -1332,7 +1555,7 @@ fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: S
             // Most log lines change nothing. Emitting regardless meant two IPC
             // messages and a full re-render for every line the core printed.
             if *snapshot != before {
-                emit_snapshot(app, &snapshot);
+                mark_snapshot_dirty(inner);
             }
             connected
         }
@@ -1347,7 +1570,7 @@ fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: S
     // transport is not getting through right now, and trying the other one is
     // worth more than a second identical pass.
     if !connected && sweep_exhausted(&message) {
-        end_fruitless_sweep(app, inner);
+        end_fruitless_sweep(inner);
     }
 
     // A tunnel that came up has spent its failures. Anything after this is a
@@ -1373,12 +1596,17 @@ fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: S
         // aim the machine at the tunnel for as long as mihomo took to load a
         // subscription -- traffic leaving with the wrong exit address, at the
         // exact moment the user believes the opposite.
-        let carrier = if chain_settings.enabled {
+        // `connected` is true for every line the core prints once the tunnel is
+        // up, not just the one that brought it up -- so this ran again on each
+        // of them, and every run tore down a working chain to build another.
+        // The log showed two starts a second apart, on different ports, leaving
+        // the screen watching a listener that had already been replaced.
+        let chain = app.state::<Chain>();
+        let carrier = if chain_settings.enabled && !chain.is_running() {
             match socks.parse::<SocketAddr>() {
-                Ok(tunnel) => match app.state::<Chain>().start(app, tunnel, &chain_settings) {
+                Ok(tunnel) => match chain.start(app, Some(tunnel), &chain_settings) {
                     Ok(address) => {
                         supervisor_log(
-                            app,
                             inner,
                             "info",
                             format!("chain listening on {address}; every node dials through the tunnel"),
@@ -1389,7 +1617,6 @@ fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: S
                         // Say which hop failed. "No route" would be a lie: the
                         // tunnel is up and it is the second hop that did not.
                         supervisor_log(
-                            app,
                             inner,
                             "error",
                             format!("the tunnel is up but the chain did not start: {error}"),
@@ -1404,7 +1631,7 @@ fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: S
         };
 
         if wanted {
-            match carrier {
+            match carrier.or_else(|| chain.address()) {
                 // mihomo's mixed listener speaks HTTP itself, so it is what the
                 // system proxy points at and the bridge is not needed at all.
                 Some(address) => apply_chain_proxy(app, inner, address),
@@ -1424,14 +1651,12 @@ fn apply_chain_proxy(app: &AppHandle, inner: &SupervisorInner, address: SocketAd
         Ok(()) => {
             inner.proxy_applied.store(true, Ordering::SeqCst);
             supervisor_log(
-                app,
                 inner,
                 "info",
                 format!("system proxy set to the chain at {address}"),
             );
         }
         Err(error) => supervisor_log(
-            app,
             inner,
             "warn",
             format!("could not set the system proxy: {error}"),
@@ -1447,7 +1672,6 @@ fn apply_system_proxy(app: &AppHandle, inner: &SupervisorInner, socks: &str) {
     }
     let Ok(address) = socks.parse::<SocketAddr>() else {
         supervisor_log(
-            app,
             inner,
             "warn",
             format!("cannot use {socks} as a system proxy address"),
@@ -1462,7 +1686,6 @@ fn apply_system_proxy(app: &AppHandle, inner: &SupervisorInner, socks: &str) {
         Ok(bridge) => bridge,
         Err(error) => {
             supervisor_log(
-                app,
                 inner,
                 "warn",
                 format!("could not start the local HTTP proxy: {error}"),
@@ -1477,7 +1700,6 @@ fn apply_system_proxy(app: &AppHandle, inner: &SupervisorInner, socks: &str) {
         Ok(()) => {
             inner.proxy_applied.store(true, Ordering::SeqCst);
             supervisor_log(
-                app,
                 inner,
                 "info",
                 format!("system proxy set to {} via {}", targets.socks, targets.http),
@@ -1489,7 +1711,6 @@ fn apply_system_proxy(app: &AppHandle, inner: &SupervisorInner, socks: &str) {
             // Nothing is pointed at the bridge, so it has no reason to stay up.
             lock(&inner.bridge).take();
             supervisor_log(
-                app,
                 inner,
                 "warn",
                 format!("could not set the system proxy: {error}"),
@@ -1504,10 +1725,6 @@ fn apply_system_proxy(app: &AppHandle, inner: &SupervisorInner, socks: &str) {
 /// a proxy left pointing at a listener that no longer exists takes the machine
 /// off the network.
 fn clear_system_proxy(app: &AppHandle, inner: &SupervisorInner) {
-    // The chain exists only to carry a live tunnel's traffic. Leaving it up
-    // after the proxy is restored would keep a listener alive that dials
-    // through a SOCKS port nothing is answering on.
-    app.state::<Chain>().stop();
     // Whatever else happens, the proxy is going back, so nothing is held any
     // more. Cleared unconditionally: the flag must never outlive the block, or
     // the screen tells the user they are protected when they are not.
@@ -1515,7 +1732,7 @@ fn clear_system_proxy(app: &AppHandle, inner: &SupervisorInner) {
         let mut snapshot = lock(&inner.snapshot);
         if snapshot.blocking {
             snapshot.blocking = false;
-            emit_snapshot(app, &snapshot);
+            mark_snapshot_dirty(inner);
         }
     }
     if !inner.proxy_applied.swap(false, Ordering::SeqCst) {
@@ -1525,12 +1742,11 @@ fn clear_system_proxy(app: &AppHandle, inner: &SupervisorInner) {
     // that is about to stop answering.
     lock(&inner.bridge).take();
     match system_proxy::revert(app) {
-        Ok(()) => supervisor_log(app, inner, "info", "system proxy restored".into()),
+        Ok(()) => supervisor_log(inner, "info", "system proxy restored".into()),
         Err(error) => {
             // Leave the flag cleared but say so loudly: the backup file stays on
             // disk, so the next launch will try again.
             supervisor_log(
-                app,
                 inner,
                 "error",
                 format!("could not restore the system proxy: {error}"),
@@ -1560,7 +1776,7 @@ fn sweep_exhausted(message: &str) -> bool {
 /// `handle_exit` applies the attempt count, the backoff and the transport
 /// alternation that were already written and never previously reachable from
 /// this state.
-fn end_fruitless_sweep(app: &AppHandle, inner: &SupervisorInner) {
+fn end_fruitless_sweep(inner: &SupervisorInner) {
     let mut guard = lock(&inner.child);
     let Some(child) = guard.as_mut() else {
         return;
@@ -1572,7 +1788,6 @@ fn end_fruitless_sweep(app: &AppHandle, inner: &SupervisorInner) {
     let _ = child.kill();
     drop(guard);
     supervisor_log(
-        app,
         inner,
         "warn",
         "a full sweep found no gateway; trying the other transport rather than repeating it".into(),
@@ -1675,6 +1890,9 @@ fn parse_latency_ms(message: &str) -> Option<f64> {
 }
 
 fn stop_inner(inner: &SupervisorInner, app: &AppHandle) -> Result<(), String> {
+    // The chain exists only to carry a live tunnel's traffic; without one it
+    // would sit there dialling a SOCKS port nothing is answering on.
+    app.state::<Chain>().stop();
     // Invalidate first. A retry sleeping out its backoff has no child to kill,
     // and would otherwise launch a process after the user asked it to stop.
     inner.generation.fetch_add(1, Ordering::SeqCst);
@@ -1698,7 +1916,7 @@ fn stop_inner(inner: &SupervisorInner, app: &AppHandle) -> Result<(), String> {
     snapshot.last_error = None;
     snapshot.status_message = None;
     snapshot.attempt = 0;
-    emit_snapshot(app, &snapshot);
+    mark_snapshot_dirty(inner);
     Ok(())
 }
 
@@ -1960,8 +2178,82 @@ fn strip_logger_prefix(message: &str) -> String {
         .to_string()
 }
 
-fn emit_snapshot(app: &AppHandle, snapshot: &CoreSnapshot) {
-    let _ = app.emit("core-status", snapshot);
+/// Marks the snapshot as changed. The pump sends the latest one.
+///
+/// Coalescing matters as much as batching: a scan can change state several
+/// times a second, and the window only ever needs the newest.
+fn mark_snapshot_dirty(inner: &SupervisorInner) {
+    inner.snapshot_dirty.store(true, Ordering::SeqCst);
+}
+
+/// Delivers buffered logs and snapshot changes to the window on a timer.
+///
+/// One thread for the life of the app. Emitting from the reader thread is what
+/// let a slow window throttle the core -- this keeps the two apart, so the core
+/// runs at full speed whether or not anything is listening.
+pub fn start_pump(app: AppHandle, supervisor: &CoreSupervisor) {
+    let inner = supervisor.inner.clone();
+    let log_path = session_log_path(&app);
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(120));
+
+        let batch: Vec<CoreLogEvent> = {
+            let mut pending = lock(&inner.pending);
+            if pending.is_empty() {
+                Vec::new()
+            } else {
+                std::mem::take(&mut *pending)
+            }
+        };
+        if !batch.is_empty() {
+            if let Some(path) = log_path.as_deref() {
+                append_session_log(path, &batch);
+            }
+            let _ = app.emit("core-logs", &batch);
+        }
+        if inner.snapshot_dirty.swap(false, Ordering::SeqCst) {
+            let snapshot = lock(&inner.snapshot).clone();
+            let _ = app.emit("core-status", &snapshot);
+        }
+    });
+}
+
+/// Where this run's log is kept on disk.
+///
+/// The in-memory buffer holds the last {MAX_LOGS} lines and dies with the
+/// process, which is exactly the wrong shape for the failures worth reporting:
+/// a crash, a freeze, or a scan that took ten minutes and scrolled the evidence
+/// away. Written from the pump, so the thread reading the core still never
+/// waits on anything.
+fn session_log_path(app: &AppHandle) -> Option<PathBuf> {
+    let dir = app.path().app_log_dir().ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("core.log");
+    // One rotation, so the file that survives a crash is still there after the
+    // restart that follows it -- and the pair stays bounded.
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_LOG_BYTES) {
+        let _ = std::fs::rename(&path, dir.join("core.previous.log"));
+    }
+    Some(path)
+}
+
+/// Two megabytes: a few thousand lines, which covers a long scan and several
+/// retries without letting an app left running for weeks fill a disk.
+const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+
+fn append_session_log(path: &Path, batch: &[CoreLogEvent]) {
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let mut text = String::new();
+    for event in batch {
+        text.push_str(&format!(
+            "{} [{}/{}] {}
+",
+            event.timestamp, event.stream, event.level, event.message
+        ));
+    }
+    let _ = file.write_all(text.as_bytes());
 }
 
 fn now_millis() -> u64 {
@@ -2422,5 +2714,60 @@ mod tests {
         profile = CoreProfile::default();
         profile.fragment_delay = "0".into();
         profile.validate().unwrap();
+    }
+}
+
+/// A headless stand-in for [`launch`], for pinning down "works in a terminal,
+/// not in the app". Run it with the app closed:
+///
+///     cargo test spawn_like_the_app -- --ignored --nocapture
+///
+/// It builds the child exactly as `launch` does -- same arguments, working
+/// directory, environment, piped stdio and creation flags -- and prints each
+/// line with the milliseconds since spawn, so the point where the two diverge
+/// is visible rather than inferred.
+#[cfg(test)]
+mod spawn_repro {
+    use super::*;
+
+    #[test]
+    #[ignore = "spawns the real core and talks to the network"]
+    fn spawn_like_the_app() {
+        let config_dir = PathBuf::from(std::env::var("WHITEAESTHER_CONFIG_DIR").expect(
+            "set WHITEAESTHER_CONFIG_DIR to the app config directory",
+        ));
+        let core_path = PathBuf::from(
+            std::env::var("WHITEAESTHER_CORE_PATH").expect("set WHITEAESTHER_CORE_PATH"),
+        );
+        let identity_path = config_dir.join("identity").join("aether.toml");
+        let profile = CoreProfile::default();
+
+        let mut command = Command::new(&core_path);
+        command
+            .args(profile.args(&identity_path))
+            .current_dir(&config_dir)
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        hide_console_window(&mut command);
+
+        let started = Instant::now();
+        let mut child = command.spawn().expect("spawn");
+        let stdout = child.stdout.take().expect("stdout");
+        let stderr = child.stderr.take().expect("stderr");
+        for (reader, name) in [
+            (Box::new(stdout) as Box<dyn Read + Send>, "out"),
+            (Box::new(stderr) as Box<dyn Read + Send>, "err"),
+        ] {
+            thread::spawn(move || {
+                for line in BufReader::new(reader).lines().map_while(Result::ok) {
+                    println!("[{:>6}ms {name}] {line}", started.elapsed().as_millis());
+                }
+            });
+        }
+        thread::sleep(Duration::from_secs(45));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

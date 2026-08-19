@@ -77,6 +77,12 @@ fn toggle_main_window(app: &AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Before anything else, so a second launch never reaches setup(). Its
+        // proxy recovery would revert the settings the running copy applied,
+        // and its window would report "Not connected" over a live tunnel.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .manage(CoreSupervisor::new())
         .manage(Chain::new())
@@ -89,6 +95,10 @@ pub fn run() {
                 Ok(false) => {}
                 Err(error) => eprintln!("could not restore the system proxy: {error}"),
             }
+
+            // One thread delivers logs and status to the window on a timer, so
+            // the core's own progress never waits on the interface.
+            core_supervisor::start_pump(app.handle().clone(), &app.state::<CoreSupervisor>());
 
             let open = MenuItem::with_id(app, "open", "Open WhiteAesther", true, None::<&str>)?;
             let connection = MenuItem::with_id(
@@ -188,6 +198,7 @@ pub fn run() {
             core_supervisor::load_profile,
             core_supervisor::save_report,
             core_supervisor::set_system_proxy,
+            core_supervisor::set_chain,
             scanner::scan_endpoints,
             scanner::test_endpoint,
             scanner::cancel_scan,

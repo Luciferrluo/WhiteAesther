@@ -18,6 +18,12 @@ export interface ChainSource {
 
 export interface ChainSettings {
   enabled: boolean;
+  /**
+   * Dial the nodes from inside the tunnel. On by default — it is what hides the
+   * node's address from the local network — but it makes the chain impossible
+   * whenever the tunnel cannot connect.
+   */
+  throughTunnel: boolean;
   sources: ChainSource[];
   /** Config URIs pasted by hand, one per line. mihomo converts these itself. */
   manual: string;
@@ -145,7 +151,7 @@ export const DEFAULT_PROFILE: ConnectionProfile = {
   gateway: false,
   systemProxy: false,
   autoReconnect: true,
-  chain: { enabled: false, sources: [], manual: "", node: null },
+  chain: { enabled: false, throughTunnel: true, sources: [], manual: "", node: null },
   killSwitch: false,
 };
 
