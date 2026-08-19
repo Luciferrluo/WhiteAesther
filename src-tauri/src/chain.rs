@@ -513,6 +513,14 @@ fn request(
         .and_then(|value| value.parse::<u16>().ok())
         .ok_or("the chain gave an unreadable reply")?;
 
+    // Go sets Content-Length only for a reply small enough to buffer, and
+    // frames the rest in chunks. That is why this went unnoticed for so long:
+    // /version is 35 bytes and arrives whole, so the readiness check passed and
+    // the chain reported itself up, while the node list -- the one reply that is
+    // always large -- reached the JSON parser with its chunk header still on the
+    // front. "expected value at line 1 column 1" reads like the chain crashed,
+    // not like a reply we never finished reading.
+    let mut chunked = false;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
@@ -521,15 +529,66 @@ fn request(
         if line == "\r\n" || line == "\n" {
             break;
         }
+        let lowered = line.to_ascii_lowercase();
+        if let Some(value) = lowered.strip_prefix("transfer-encoding:") {
+            chunked = value.contains("chunked");
+        }
     }
-    let mut rest = String::new();
-    let _ = reader.read_to_string(&mut rest);
+    let rest = if chunked {
+        read_chunked(&mut reader)?
+    } else {
+        let mut body = String::new();
+        let _ = reader.read_to_string(&mut body);
+        body
+    };
 
     if !(200..300).contains(&code) {
         return Err(format!("the chain refused that request ({code})"));
     }
     Ok(rest)
 }
+
+/// Reassembles a chunked body.
+///
+/// Only what reading one requires: sizes are hex, may carry a `;extension`
+/// this ignores, and a zero-length chunk ends the body. Trailers after it are
+/// left unread, because the connection is closing anyway.
+fn read_chunked<R: BufRead>(reader: &mut R) -> Result<String, String> {
+    let mut body = Vec::new();
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).map_err(|e| e.to_string())? == 0 {
+            break;
+        }
+        let size = header.trim().split(';').next().unwrap_or_default();
+        if size.is_empty() {
+            continue;
+        }
+        let size = usize::from_str_radix(size, 16)
+            .map_err(|_| "the chain framed its reply in a way we cannot read".to_string())?;
+        if size == 0 {
+            break;
+        }
+        // The length is the peer's word, not ours, and this reply is a node
+        // list rather than a download.
+        if body.len() + size > MAX_BODY {
+            return Err("the chain sent more than we are willing to hold".into());
+        }
+        let mut chunk = vec![0u8; size];
+        reader
+            .read_exact(&mut chunk)
+            .map_err(|error| format!("the chain stopped mid-reply: {error}"))?;
+        body.extend_from_slice(&chunk);
+        // The line break that closes the chunk.
+        let mut terminator = String::new();
+        let _ = reader.read_line(&mut terminator);
+    }
+    String::from_utf8(body).map_err(|_| "the chain sent something that is not text".into())
+}
+
+/// Eight megabytes: far beyond any node list, far below anything that matters
+/// to a desktop.
+const MAX_BODY: usize = 8 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -621,5 +680,22 @@ mod tests {
         assert_eq!(encode("xhttp-tls -cdn"), "xhttp-tls%20-cdn");
         assert_eq!(encode("safe-._~"), "safe-._~");
         assert!(encode("🇯🇵 tokyo").starts_with('%'));
+    }
+
+    #[test]
+    fn a_chunked_reply_is_reassembled() {
+        // The shape mihomo actually sends a node list in: a hex size, the
+        // bytes, then a zero chunk. Before this was read, that size line went
+        // to the JSON parser and every node list looked like a crash.
+        let wire = "5\r\nhello\r\n2\r\n!!\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(wire.as_bytes());
+        assert_eq!(read_chunked(&mut reader).unwrap(), "hello!!");
+    }
+
+    #[test]
+    fn a_chunk_larger_than_we_will_hold_is_refused() {
+        let wire = format!("{:x}\r\n", MAX_BODY + 1);
+        let mut reader = BufReader::new(wire.as_bytes());
+        assert!(read_chunked(&mut reader).is_err());
     }
 }
