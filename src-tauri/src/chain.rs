@@ -61,6 +61,14 @@ pub struct ChainSource {
 #[serde(rename_all = "camelCase")]
 pub struct ChainSettings {
     pub enabled: bool,
+    /// Dial the nodes from inside the MASQUE tunnel.
+    ///
+    /// On by default, and worth keeping: it is what hides the node's address
+    /// and SNI from the local network. But it makes the chain impossible
+    /// whenever the tunnel cannot connect -- and on a network that resets
+    /// MASQUE, that is always -- so it can be turned off to reach the nodes
+    /// directly instead of reaching nothing at all.
+    pub through_tunnel: bool,
     /// Subscription URLs. Ours ships as the first entry; the user may add more.
     pub sources: Vec<ChainSource>,
     /// Config URIs pasted by hand, one per line. mihomo converts these itself,
@@ -73,7 +81,13 @@ pub struct ChainSettings {
 
 impl Default for ChainSettings {
     fn default() -> Self {
-        Self { enabled: false, sources: Vec::new(), manual: String::new(), node: None }
+        Self {
+            enabled: false,
+            through_tunnel: true,
+            sources: Vec::new(),
+            manual: String::new(),
+            node: None,
+        }
     }
 }
 
@@ -123,7 +137,7 @@ impl Chain {
     pub fn start(
         &self,
         app: &AppHandle,
-        tunnel: SocketAddr,
+        tunnel: Option<SocketAddr>,
         settings: &ChainSettings,
     ) -> Result<SocketAddr, String> {
         self.stop();
@@ -135,6 +149,9 @@ impl Chain {
             .collect();
         if usable.is_empty() && settings.manual.trim().is_empty() {
             return Err("add a subscription or a config before turning the chain on".into());
+        }
+        if settings.through_tunnel && tunnel.is_none() {
+            return Err("connect first, or turn off \"dial nodes through the tunnel\"".into());
         }
 
         let binary = locate(app)?;
@@ -305,7 +322,7 @@ impl Drop for Chain {
 /// a subscription of any size arrive without us parsing or rewriting a single
 /// entry: every node it carries inherits the tunnel.
 fn render(
-    tunnel: SocketAddr,
+    tunnel: Option<SocketAddr>,
     mixed: u16,
     api: u16,
     secret: &str,
@@ -328,11 +345,19 @@ fn render(
          - https://dns.google/dns-query\n",
     );
 
-    config.push_str(&format!(
-        "proxies:\n  - {{name: {TUNNEL_PROXY}, type: socks5, server: {}, port: {}, udp: true}}\n",
-        tunnel.ip(),
-        tunnel.port()
-    ));
+    // Declared only when there is a tunnel to declare. A socks5 proxy pointing
+    // at a port nothing is listening on would fail every node it fronted.
+    let through = match tunnel {
+        Some(address) => {
+            config.push_str(&format!(
+                "proxies:\n  - {{name: {TUNNEL_PROXY}, type: socks5, server: {}, port: {}, udp: true}}\n",
+                address.ip(),
+                address.port()
+            ));
+            format!("\n    dialer-proxy: {TUNNEL_PROXY}")
+        }
+        None => String::new(),
+    };
 
     let mut names: Vec<String> = Vec::new();
     if !sources.is_empty() || !manual.trim().is_empty() {
@@ -343,7 +368,7 @@ fn render(
         names.push(key.clone());
         config.push_str(&format!(
             "  {key}:\n    type: http\n    url: {}\n    interval: 3600\n    \
-             path: ./providers/{key}.yaml\n    dialer-proxy: {TUNNEL_PROXY}\n    \
+             path: ./providers/{key}.yaml{through}\n    \
              health-check: {{enable: true, url: \"http://www.gstatic.com/generate_204\", \
              interval: 300, lazy: true}}\n",
             serde_json::to_string(&source.url).unwrap_or_default()
@@ -352,8 +377,8 @@ fn render(
     if !manual.trim().is_empty() {
         names.push(MANUAL_PROVIDER.into());
         config.push_str(&format!(
-            "  {MANUAL_PROVIDER}:\n    type: file\n    path: ./providers/manual.txt\n    \
-             dialer-proxy: {TUNNEL_PROXY}\n    health-check: {{enable: true, \
+            "  {MANUAL_PROVIDER}:\n    type: file\n    path: ./providers/manual.txt{through}\n    \
+             health-check: {{enable: true, \
              url: \"http://www.gstatic.com/generate_204\", interval: 300, lazy: true}}\n"
         ));
     }
@@ -514,8 +539,8 @@ mod tests {
         ChainSource { name: name.into(), url: url.into(), enabled: true }
     }
 
-    fn tunnel() -> SocketAddr {
-        "127.0.0.1:1819".parse().unwrap()
+    fn tunnel() -> Option<SocketAddr> {
+        Some("127.0.0.1:1819".parse().unwrap())
     }
 
     #[test]
@@ -565,6 +590,22 @@ mod tests {
         assert!(config.contains("example.com/on"));
         assert!(!config.contains("example.com/off"));
         let _ = off;
+    }
+
+    #[test]
+    fn without_a_tunnel_the_nodes_are_reached_directly() {
+        // The whole point of the fallback: on a network that resets MASQUE the
+        // tunnel never comes up, and a config that still insisted on dialling
+        // through it would leave the user with nothing working at all.
+        let config = render(None, 1820, 1821, "s", &[], "vless://x");
+        assert!(!config.contains("dialer-proxy"), "nothing to dial through");
+        assert!(
+            !config.contains("type: socks5"),
+            "a socks5 proxy pointing at a dead port would fail every node it fronted",
+        );
+        // Everything else must still hold: no direct rule, DNS inside the chain.
+        assert!(config.contains("MATCH,exit"));
+        assert!(config.contains("enhanced-mode: fake-ip"));
     }
 
     #[test]

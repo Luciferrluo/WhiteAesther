@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { ConnectionProfile, CoreLogEvent, CoreProbe, CoreSnapshot } from "../types";
+import type { ChainSettings, ConnectionProfile, CoreLogEvent, CoreProbe, CoreSnapshot } from "../types";
 
 export function isDesktopRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -58,14 +58,21 @@ export async function saveReport(contents: string, filename: string): Promise<st
   return invoke("save_report", { contents, filename });
 }
 
+/**
+ * Log lines arrive in batches, not one message per line.
+ *
+ * The thread reading the core's output is the only thing draining its pipe, so
+ * a message per line made a busy window throttle the core itself. Batching is
+ * the contract, not an optimisation: keep appending a whole batch at once.
+ */
 export async function subscribeCore(
   onStatus: (status: CoreSnapshot) => void,
-  onLog: (log: CoreLogEvent) => void,
+  onLogs: (logs: CoreLogEvent[]) => void,
 ): Promise<UnlistenFn> {
   requireDesktop();
   const unlistenStatus = await listen<CoreSnapshot>("core-status", (event) => onStatus(event.payload));
-  const unlistenLog = await listen<CoreLogEvent>("core-log", (event) => onLog(event.payload));
-  return () => { unlistenStatus(); unlistenLog(); };
+  const unlistenLogs = await listen<CoreLogEvent[]>("core-logs", (event) => onLogs(event.payload));
+  return () => { unlistenStatus(); unlistenLogs(); };
 }
 
 export type TrayAction = "toggle-connection" | "open-diagnostics" | "restore-proxy";
@@ -159,6 +166,15 @@ export interface ChainNode {
   kind: string;
   /** Milliseconds through the tunnel, or null when the last test failed. */
   delay: number | null;
+}
+
+/**
+ * Turns the chain on or off on a live connection, and reloads it after a
+ * subscription changes. Returns whether it is now carrying traffic.
+ */
+export async function setChain(settings: ChainSettings): Promise<boolean> {
+  requireDesktop();
+  return invoke("set_chain", { settings });
 }
 
 export async function chainStatus(): Promise<ChainStatus> {
