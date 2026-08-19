@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tauri::State;
 
+use crate::chain::Chain;
 use crate::core_supervisor::CoreSupervisor;
 use crate::http_bridge::socks5_connect;
 
@@ -26,7 +27,10 @@ use crate::http_bridge::socks5_connect;
 /// A routing rule that sends this address direct would measure the direct path
 /// instead; that is a deliberate choice by whoever wrote the rule.
 const TARGET_HOST: &str = "1.1.1.1";
-const TARGET_PORT: u16 = 443;
+/// Port 80, because the probe now asks for a byte back and needs a server that
+/// will answer in the clear. There is no TLS client in this crate, and nothing
+/// here is secret -- it is a fixed request to a public resolver's web front.
+const TARGET_PORT: u16 = 80;
 
 /// Short on purpose. A probe that has not answered in this long has told us
 /// what we needed to know, and holding the thread longer only delays the next
@@ -54,19 +58,38 @@ pub async fn probe_latency(supervisor: State<'_, CoreSupervisor>) -> Result<Opti
         .map_err(|error| format!("the latency probe did not finish: {error}"))
 }
 
+/// One round trip through the tunnel, for anything that needs to judge the
+/// route rather than display it.
+pub(crate) fn round_trip_ms(socks: SocketAddr) -> Option<f64> {
+    measure(socks)
+}
+
+/// Times a request and its first byte back, not just the handshake.
+///
+/// Timing the SOCKS5 CONNECT alone was measuring the wrong thing: opening a
+/// connection through a congested tunnel stays fast, because the engine answers
+/// as soon as the far end accepts. A gateway that had degraded to five seconds
+/// a page still charted at thirty milliseconds, so the screen said the route was
+/// healthy while nothing would load. Waiting for a byte to come back is the
+/// cheapest measurement that moves when the experience does.
 fn measure(socks: SocketAddr) -> Option<f64> {
     let started = Instant::now();
-    match socks5_connect(socks, TARGET_HOST, TARGET_PORT, PROBE_TIMEOUT) {
-        Ok(stream) => {
-            let elapsed = started.elapsed();
-            // Closing before the timer would count teardown in the figure.
-            drop(stream);
-            Some(elapsed.as_secs_f64() * 1000.0)
-        }
-        // A refused or timed-out probe is a real answer about the route, but it
-        // is not a number, and a gap in the chart says it better than a zero.
-        Err(_) => None,
+    let mut stream = socks5_connect(socks, TARGET_HOST, TARGET_PORT, PROBE_TIMEOUT).ok()?;
+    stream.set_read_timeout(Some(PROBE_TIMEOUT)).ok()?;
+    stream.set_write_timeout(Some(PROBE_TIMEOUT)).ok()?;
+    // HEAD, so the answer is a header and nothing is downloaded to time.
+    let request = format!(
+        "HEAD / HTTP/1.1\r\nHost: {TARGET_HOST}\r\nUser-Agent: WhiteAesther\r\n\n         Connection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut first = [0u8; 1];
+    // A closed connection with nothing on it is a failed probe, not a fast one.
+    if stream.read(&mut first).ok()? == 0 {
+        return None;
     }
+    let elapsed = started.elapsed();
+    drop(stream);
+    Some(elapsed.as_secs_f64() * 1000.0)
 }
 
 /// How fast the tunnel actually carries bulk traffic.
@@ -167,29 +190,51 @@ pub struct ExitInfo {
     pub country: String,
     /// The datacentre the traffic left from, as a three-letter airport code.
     pub colo: String,
-    /// Whether Cloudflare sees this connection as WARP at all. False here means
-    /// the request went out around the tunnel, not through it.
+    /// Whether Cloudflare sees this connection as WARP at all.
+    ///
+    /// Only meaningful when `chained` is false. Through a second hop it is
+    /// always off, because the last leg is the node's own connection and not a
+    /// WARP one -- which is the point of the hop, not a fault.
     pub warp: bool,
     /// Whether an organisation's Zero Trust gateway is applying policy.
     pub gateway: bool,
+    /// Whether this was read through the second hop rather than the tunnel.
+    pub chained: bool,
 }
 
-/// Reads the exit address and country from inside the tunnel.
+/// Reads the exit address and country from wherever traffic actually leaves.
+///
+/// Follows the chain when there is one. Reading the tunnel regardless was the
+/// bug this replaces: with a second hop carrying traffic, the card reported
+/// Cloudflare's address while every application was leaving through the node --
+/// the card contradicting the browser on the one question it exists to answer.
 #[tauri::command]
-pub async fn exit_info(supervisor: State<'_, CoreSupervisor>) -> Result<ExitInfo, String> {
-    let socks = supervisor
-        .connected_socks()
-        .ok_or("connect first — there is nothing to look up")?;
-    let address: SocketAddr = socks
-        .parse()
-        .map_err(|_| format!("the proxy address {socks} cannot be parsed"))?;
+pub async fn exit_info(
+    supervisor: State<'_, CoreSupervisor>,
+    chain: State<'_, Chain>,
+) -> Result<ExitInfo, String> {
+    let carrier = chain.address();
+    let address: SocketAddr = match carrier {
+        // mihomo's listener is a mixed one, so it answers SOCKS5 here exactly
+        // as the tunnel does.
+        Some(address) => address,
+        None => {
+            let socks = supervisor
+                .connected_socks()
+                .ok_or("connect first — there is nothing to look up")?;
+            socks
+                .parse()
+                .map_err(|_| format!("the proxy address {socks} cannot be parsed"))?
+        }
+    };
+    let chained = carrier.is_some();
 
-    tauri::async_runtime::spawn_blocking(move || fetch_trace(address))
+    tauri::async_runtime::spawn_blocking(move || fetch_trace(address, chained))
         .await
         .map_err(|error| format!("the lookup did not finish: {error}"))?
 }
 
-fn fetch_trace(socks: SocketAddr) -> Result<ExitInfo, String> {
+fn fetch_trace(socks: SocketAddr, chained: bool) -> Result<ExitInfo, String> {
     // Plain HTTP on purpose: this crate has no TLS client, and the endpoint
     // answers over both. Nothing here is secret -- it is the address a website
     // would read anyway -- and it travels inside the tunnel regardless.
@@ -207,6 +252,7 @@ fn fetch_trace(socks: SocketAddr) -> Result<ExitInfo, String> {
         colo: field("colo").unwrap_or_default(),
         warp: field("warp").as_deref() == Some("on"),
         gateway: field("gateway").as_deref() == Some("on"),
+        chained,
     })
 }
 
@@ -265,7 +311,7 @@ mod tests {
     #[test]
     fn a_lookup_against_a_dead_listener_fails_rather_than_inventing_a_country() {
         let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        assert!(fetch_trace(dead).is_err());
+        assert!(fetch_trace(dead, false).is_err());
     }
 
     #[test]

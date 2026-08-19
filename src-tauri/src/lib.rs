@@ -77,6 +77,12 @@ fn toggle_main_window(app: &AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Before anything else, so a second launch never reaches setup(). Its
+        // proxy recovery would revert the settings the running copy applied,
+        // and its window would report "Not connected" over a live tunnel.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .manage(CoreSupervisor::new())
         .manage(Chain::new())

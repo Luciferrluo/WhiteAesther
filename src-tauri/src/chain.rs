@@ -29,6 +29,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+use crate::core_supervisor::CoreSupervisor;
+
 /// The name the generated config gives the first hop. Referenced by every node
 /// through `dialer-proxy`, which is what puts them behind the tunnel.
 const TUNNEL_PROXY: &str = "aether";
@@ -163,7 +165,12 @@ impl Chain {
         std::fs::create_dir_all(home.join("providers"))
             .map_err(|error| format!("cannot prepare the chain directory: {error}"))?;
 
-        let mixed = free_port()?;
+        // The mixed port is an address a person types into a browser, so it has
+        // to be the same one tomorrow. An ephemeral port meant every launch
+        // moved it, and anything configured against the last run quietly went
+        // out past the hop with the old exit address.
+        let mixed = preferred_port(tunnel.map_or(DEFAULT_MIXED_PORT, next_port))?;
+        // The API stays ephemeral: only this process ever speaks to it.
         let api = free_port()?;
         let secret = secret();
 
@@ -196,6 +203,36 @@ impl Chain {
         let mut child = command
             .spawn()
             .map_err(|error| format!("cannot start the chain: {error}"))?;
+
+        // Piped and never read is a process that blocks on its own logging once
+        // the pipe fills. It also threw away the only account of what the chain
+        // was doing: mihomo marks every node dead when the tunnel underneath
+        // slows down, and none of that reached anyone.
+        for (reader, name) in [
+            (child.stdout.take().map(|out| Box::new(out) as Box<dyn Read + Send>), "chain"),
+            (child.stderr.take().map(|err| Box::new(err) as Box<dyn Read + Send>), "chain"),
+        ] {
+            let Some(reader) = reader else {
+                continue;
+            };
+            let app = app.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(reader).lines().map_while(Result::ok) {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let level = if line.contains("level=error") {
+                        "error"
+                    } else if line.contains("level=warning") {
+                        "warn"
+                    } else {
+                        "info"
+                    };
+                    app.state::<CoreSupervisor>().record(name, level, line.to_string());
+                }
+            });
+        }
 
         let api_address = SocketAddr::from((Ipv4Addr::LOCALHOST, api));
         if let Err(error) = wait_until_ready(api_address, &secret) {
@@ -335,7 +372,10 @@ fn render(
     // web page the user opens could drive this API and reroute their traffic.
     config.push_str(&format!("external-controller: 127.0.0.1:{api}\n"));
     config.push_str(&format!("secret: {}\n", serde_json::to_string(secret).unwrap_or_default()));
-    config.push_str("mode: rule\nlog-level: warning\nipv6: true\n");
+    // info, not warning: a node list where every entry reads dead is explained
+    // by the health-check lines, and those are info. They cost a few lines a
+    // minute and now go to the app log rather than an undrained pipe.
+    config.push_str("mode: rule\nlog-level: info\nipv6: true\n");
 
     // Resolvers live inside the chain. A query that escapes to the local
     // network names the destination even when the traffic itself does not.
@@ -422,6 +462,28 @@ fn locate(app: &AppHandle) -> Result<PathBuf, String> {
 /// There is a gap between letting go of the port and mihomo binding it. Nothing
 /// on a desktop is racing for a random high port, and the alternative -- fixed
 /// ports -- collides with whatever else the machine is already running.
+/// The mixed port used when there is no tunnel to derive one from.
+const DEFAULT_MIXED_PORT: u16 = 1820;
+
+/// One above the tunnel's own port, so the two read as a pair.
+fn next_port(tunnel: SocketAddr) -> u16 {
+    tunnel.port().checked_add(1).unwrap_or(DEFAULT_MIXED_PORT)
+}
+
+/// Takes `want` when it is free, and any free port when it is not.
+///
+/// Falling back rather than failing matters: something else holding one port is
+/// a reason to move, not a reason to leave the user without a second hop.
+fn preferred_port(want: u16) -> Result<u16, String> {
+    match TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, want))) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(want)
+        }
+        Err(_) => free_port(),
+    }
+}
+
 fn free_port() -> Result<u16, String> {
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .map_err(|error| format!("no free local port: {error}"))?;
@@ -697,5 +759,21 @@ mod tests {
         let wire = format!("{:x}\r\n", MAX_BODY + 1);
         let mut reader = BufReader::new(wire.as_bytes());
         assert!(read_chunked(&mut reader).is_err());
+    }
+
+    #[test]
+    fn the_mixed_port_sits_next_to_the_tunnel() {
+        // A person configures this one in a browser, so it has to be derivable
+        // and the same on the next launch rather than whatever was free.
+        assert_eq!(next_port("127.0.0.1:1819".parse().unwrap()), 1820);
+        assert_eq!(next_port("127.0.0.1:65535".parse().unwrap()), DEFAULT_MIXED_PORT);
+    }
+
+    #[test]
+    fn a_taken_port_moves_rather_than_failing() {
+        let held = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let taken = held.local_addr().unwrap().port();
+        let chosen = preferred_port(taken).unwrap();
+        assert_ne!(chosen, taken);
     }
 }

@@ -5,11 +5,11 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
-import { type ExitInfo, exitInfo, speedTest } from "@/core/api";
+import { type ExitInfo, chainStatus, exitInfo, speedTest } from "@/core/api";
 import { ConnectOrb, type OrbState } from "./ConnectOrb";
 import { Sparkline } from "./Sparkline";
 import { type Sample, summarise } from "./latency";
-import { CARRY_OPTIONS, type CarryMode, describeCarry } from "./carry";
+import { CARRY_OPTIONS, type CarryMode, carryDetail, describeCarry } from "./carry";
 import type { ConnectionProfile, CoreProbe, CoreSnapshot } from "@/types";
 
 interface SimpleProps {
@@ -29,8 +29,41 @@ interface SimpleProps {
 
 const BUSY = new Set(["starting", "scanning", "connecting", "reconnecting"]);
 
+/**
+ * The address traffic actually leaves this machine on.
+ *
+ * The tunnel's SOCKS port until a second hop is running, and the hop's listener
+ * after that. Everything the screen says about "point apps here" and everything
+ * it measures has to follow this, or it describes a route nothing is taking.
+ */
+function useCarryAddress(snapshot: CoreSnapshot): string {
+  const [chain, setChain] = useState<string | null>(null);
+  const live = snapshot.state === "connected";
+
+  useEffect(() => {
+    if (!live) {
+      setChain(null);
+      return;
+    }
+    let disposed = false;
+    const read = () => {
+      void chainStatus()
+        .then((status) => { if (!disposed) setChain(status.running ? status.address : null); })
+        .catch(() => { if (!disposed) setChain(null); });
+    };
+    read();
+    // The hop can be switched on from the Advanced screen while this one is
+    // mounted, and the answer here changes the moment it is.
+    const timer = window.setInterval(read, 4_000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [live]);
+
+  return chain ?? snapshot.socksAddress;
+}
+
 export function Simple(props: SimpleProps) {
   const { snapshot, probe } = props;
+  const carryAddress = useCarryAddress(snapshot);
   const busy = BUSY.has(snapshot.state);
   const failed = snapshot.state === "error";
   const live = snapshot.state === "connected";
@@ -54,12 +87,12 @@ export function Simple(props: SimpleProps) {
             disabled={!probe.available && !live && !busy}
             onClick={props.onToggle}
           />
-          <Headline {...props} />
+          <Headline {...props} carryAddress={carryAddress} />
           <Actions {...props} />
         </aside>
 
         <div className="flex min-w-0 flex-1 flex-col gap-3.5">
-          {live ? <Connected {...props} /> : null}
+          {live ? <Connected {...props} carryAddress={carryAddress} /> : null}
           {busy ? <Searching {...props} /> : null}
           {failed ? <Failed {...props} /> : null}
           {!live && !busy && !failed ? <Idle {...props} /> : null}
@@ -67,7 +100,7 @@ export function Simple(props: SimpleProps) {
       </div>
 
       <div className="px-5 pb-4 pt-3.5">
-        <CarryPicker carry={props.carry} onCarry={props.onCarry} />
+        <CarryPicker carry={props.carry} onCarry={props.onCarry} carryAddress={carryAddress} />
       </div>
     </div>
   );
@@ -75,14 +108,14 @@ export function Simple(props: SimpleProps) {
 
 // ------------------------------------------------------------------ the panel
 
-function Headline({ snapshot, carry, probe }: SimpleProps) {
+function Headline({ snapshot, carry, probe, carryAddress }: SimpleProps & { carryAddress: string }) {
   const live = snapshot.state === "connected";
   const busy = BUSY.has(snapshot.state);
   const failed = snapshot.state === "error";
 
   const title = live ? "You're through" : busy ? "Testing paths out" : failed ? "Nothing got out" : "Ready when you are";
   const detail = live
-    ? `${transportName(snapshot.transport)} · ${describeCarry(carry, snapshot.socksAddress)}`
+    ? `${transportName(snapshot.transport)} · ${describeCarry(carry, carryAddress)}`
     : busy
       ? (snapshot.statusMessage ?? "Testing paths out of this network.")
       : failed
@@ -185,7 +218,13 @@ function Kbd({ children }: { children: React.ReactNode }) {
 
 // -------------------------------------------------------------------- content
 
-function Connected({ snapshot, profile, latency, onProfile }: SimpleProps) {
+function Connected({
+  snapshot,
+  profile,
+  latency,
+  onProfile,
+  carryAddress,
+}: SimpleProps & { carryAddress: string }) {
   const summary = summarise(latency);
   const shown = summary.last ?? snapshot.latencyMs;
 
@@ -235,7 +274,7 @@ function Connected({ snapshot, profile, latency, onProfile }: SimpleProps) {
         </div>
       </Card>
 
-      <ExitCard />
+      <ExitCard carryAddress={carryAddress} />
 
       <Card className="surface flex items-center gap-3.5 p-3">
         <Toggle
@@ -270,28 +309,54 @@ function Connected({ snapshot, profile, latency, onProfile }: SimpleProps) {
  * WARP is explicit that it does not move you to another country. Showing the
  * real exit address settles that question instead of leaving it to guesswork.
  */
-function ExitCard() {
+/** Enough attempts to outlast a second hop loading its nodes. */
+const EXIT_TRIES = 4;
+const RETRY_AFTER_MS = 2_500;
+
+function ExitCard({ carryAddress }: { carryAddress: string }) {
   const [info, setInfo] = useState<ExitInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Keyed on where traffic is carried, so switching a second hop on or off
+  // re-reads rather than leaving the previous route's address on screen.
+  //
+  // Retried, because the first read lands while the route is still settling: a
+  // second hop answers its own port the moment it starts but cannot carry
+  // anything until its nodes have loaded, and a single attempt turned that
+  // half-second into a permanent error on a connection that was fine.
   useEffect(() => {
     let disposed = false;
+    let timer = 0;
     setInfo(null);
     setError(null);
-    void exitInfo()
-      .then((next) => { if (!disposed) setInfo(next); })
-      .catch((reason) => {
-        if (!disposed) setError(reason instanceof Error ? reason.message : String(reason));
-      });
-    return () => { disposed = true; };
-  }, []);
+
+    const attempt = (left: number) => {
+      void exitInfo()
+        .then((next) => { if (!disposed) setInfo(next); })
+        .catch((reason) => {
+          if (disposed) return;
+          if (left > 0) {
+            timer = window.setTimeout(() => attempt(left - 1), RETRY_AFTER_MS);
+            return;
+          }
+          setError(reason instanceof Error ? reason.message : String(reason));
+        });
+    };
+    attempt(EXIT_TRIES - 1);
+
+    return () => { disposed = true; window.clearTimeout(timer); };
+  }, [carryAddress]);
+
+  // Through a hop, warp is off by definition and says nothing about whether the
+  // route is good. Judging it by warp painted a working chain as a leak.
+  const good = info ? (info.chained || info.warp) : false;
 
   return (
     <Card className="surface flex items-center gap-3.5 p-3.5">
       <div
         className={[
           "grid size-[34px] shrink-0 place-items-center rounded-lg",
-          info?.warp ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground",
+          good ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground",
         ].join(" ")}
       >
         <Globe className="size-[17px]" />
@@ -310,12 +375,12 @@ function ExitCard() {
         <span
           className={[
             "shrink-0 rounded-md border px-2 py-1 text-[11px] font-semibold",
-            info.warp
+            good
               ? "border-primary/30 bg-primary/[0.11] text-primary"
               : "border-warning/40 bg-warning/[0.11] text-warning",
           ].join(" ")}
         >
-          {info.warp ? "Through the tunnel" : "Not through the tunnel"}
+          {info.chained ? "Through your node" : info.warp ? "Through the tunnel" : "Not through the tunnel"}
         </span>
       ) : null}
     </Card>
@@ -530,7 +595,11 @@ function Figure({ label, value, tone }: { label: string; value: string | number;
   );
 }
 
-function CarryPicker({ carry, onCarry }: Pick<SimpleProps, "carry" | "onCarry">) {
+function CarryPicker({
+  carry,
+  onCarry,
+  carryAddress,
+}: Pick<SimpleProps, "carry" | "onCarry"> & { carryAddress: string }) {
   return (
     <div className="grid grid-cols-3 gap-2.5">
       {CARRY_OPTIONS.map((option) => {
@@ -568,7 +637,7 @@ function CarryPicker({ carry, onCarry }: Pick<SimpleProps, "carry" | "onCarry">)
                 {active ? <Check className="size-3.5 text-primary" /> : null}
               </div>
               <div className="mt-0.5 text-[11.5px] leading-snug text-muted-foreground">
-                {option.disabled ? option.disabledReason : option.detail}
+                {option.disabled ? option.disabledReason : carryDetail(option, carryAddress)}
               </div>
             </div>
           </button>

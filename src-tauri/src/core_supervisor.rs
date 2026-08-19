@@ -459,6 +459,15 @@ impl CoreSupervisor {
         (snapshot.state == "connected").then(|| snapshot.socks_address.clone())
     }
 
+    /// Records a line from something the app runs alongside the core.
+    ///
+    /// The chain uses this for mihomo's output. Anything with a piped stream
+    /// must have it drained by somebody, or the process blocks on its own
+    /// logging once the pipe fills -- and its diagnosis is lost either way.
+    pub fn record(&self, stream: &str, level: &str, message: String) {
+        push_log(&self.inner, stream, level, message);
+    }
+
     /// Refuses when a connection is live: a scan competes with it for the same
     /// gateways and would report worse numbers than the network really offers.
     pub fn require_idle(&self, message: &str) -> Result<(), String> {
@@ -718,6 +727,7 @@ fn launch(
         spawn_log_reader(app.clone(), inner.clone(), stderr, "stderr");
     }
     spawn_exit_monitor(app.clone(), inner.clone(), generation);
+    spawn_route_watch(app.clone(), inner.clone(), generation);
 
     Ok(())
 }
@@ -1014,6 +1024,129 @@ fn spawn_log_reader<R: Read + Send + 'static>(
             }
         }
     });
+}
+
+/// How long a round trip has to take before the route counts as unusable.
+///
+/// A good edge answers in about a tenth of a second from here; a degraded one
+/// was measured at three to ten. Two seconds is far outside ordinary variance
+/// and still well inside "the page has not loaded yet".
+const BAD_ROUTE_MS: f64 = 2_000.0;
+
+/// Consecutive bad samples before acting, at [`ROUTE_WATCH`] apart.
+///
+/// Three rather than one: a single slow probe is a hiccup, and reconnecting on
+/// every hiccup would be worse than the problem.
+const BAD_ROUTE_STREAK: u32 = 3;
+const ROUTE_WATCH: Duration = Duration::from_secs(10);
+
+/// Watches the route a live tunnel is actually giving, and re-scans when it is
+/// no longer worth having.
+///
+/// The engine caches the gateway that last worked and reuses it on the next
+/// connect, checking only that it still answers a handshake -- not that it is
+/// still fast. A Cloudflare edge that degrades therefore stays pinned for good,
+/// because every successful connect writes it back to the cache. Measured on
+/// one machine, one minute apart: the cached edge took 3 to 10 seconds to first
+/// byte and then timed out, while a freshly scanned one took 0.11 seconds.
+///
+/// Nothing in the app noticed, because a handshake through a congested tunnel is
+/// still quick -- so the status chart read healthy while no page would load.
+fn spawn_route_watch(app: AppHandle, inner: Arc<SupervisorInner>, generation: u64) {
+    thread::spawn(move || {
+        let mut streak = 0u32;
+        loop {
+            thread::sleep(ROUTE_WATCH);
+            if !inner.is_current(generation) {
+                return;
+            }
+            let (state, socks) = {
+                let snapshot = lock(&inner.snapshot);
+                (snapshot.state.clone(), snapshot.socks_address.clone())
+            };
+            // Only a live tunnel has a route to judge. Connecting and retrying
+            // are already someone else's problem.
+            if state != "connected" {
+                streak = 0;
+                continue;
+            }
+            let Ok(address) = socks.parse::<SocketAddr>() else {
+                return;
+            };
+            match crate::latency::round_trip_ms(address) {
+                Some(ms) if ms < BAD_ROUTE_MS => streak = 0,
+                _ => streak += 1,
+            }
+            if streak < BAD_ROUTE_STREAK {
+                continue;
+            }
+            if !inner.is_current(generation) {
+                return;
+            }
+            rescan_bad_route(&app, &inner, generation);
+            return;
+        }
+    });
+}
+
+/// Reconnects without the cached gateway, keeping everything else as it was.
+///
+/// The transport is deliberately left alone. Alternating H2 and H3 is the answer
+/// to a transport that cannot get through at all; here it plainly can, and the
+/// edge behind it is what went bad -- moving a working transport to one this
+/// network may block would trade a slow tunnel for no tunnel.
+///
+/// The retry budget is untouched for the same reason: this is not a failed
+/// attempt, it is a good connection being replaced with a better one.
+fn rescan_bad_route(app: &AppHandle, inner: &Arc<SupervisorInner>, generation: u64) {
+    let profile = {
+        let mut guard = lock(&inner.session);
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        if session.generation != generation {
+            return;
+        }
+        // For the rest of this session. A cache that has already served one bad
+        // gateway has not earned another chance before the next launch.
+        session.profile.quick_reconnect = false;
+        session.attempt = 0;
+        session.profile.clone()
+    };
+
+    supervisor_log(
+        inner,
+        "warn",
+        format!(
+            "this gateway has been slower than {}ms for {} checks in a row; searching for a \n             better one rather than staying on it",
+            BAD_ROUTE_MS as u64, BAD_ROUTE_STREAK
+        ),
+    );
+
+    // Same shape as an explicit reconnect: invalidate, stop, start. Bumping the
+    // generation first stops the old child's monitors from treating the kill
+    // below as a crash and racing this with a retry of their own.
+    let next = inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    app.state::<Chain>().stop();
+    if let Some(child) = lock(&inner.child).take().as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    // The proxy is re-applied when the new tunnel reports itself up; leaving it
+    // pointed at the old one would strand traffic in the gap.
+    clear_system_proxy(app, inner);
+
+    *lock(&inner.session) = Some(Session { generation: next, profile: profile.clone(), attempt: 0 });
+    {
+        let mut snapshot = lock(&inner.snapshot);
+        snapshot.state = "reconnecting".into();
+        snapshot.pid = None;
+        snapshot.status_message = Some("Finding a faster gateway".into());
+        mark_snapshot_dirty(inner);
+    }
+    if let Err(error) = launch(app, inner, &profile, 0, next) {
+        handle_exit(app, inner, next, error);
+    }
 }
 
 fn spawn_exit_monitor(app: AppHandle, inner: Arc<SupervisorInner>, generation: u64) {

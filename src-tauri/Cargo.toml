@@ -23,6 +23,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
+# A second copy knows nothing about the first: it reports "Not connected" over a
+# live tunnel, and its startup recovery reverts the system proxy the first one
+# applied -- taking the running session off the network from the outside.
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

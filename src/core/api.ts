@@ -142,9 +142,15 @@ export interface ExitInfo {
   /** Two-letter country as Cloudflare geolocates that address. */
   country: string;
   colo: string;
-  /** False means the request went around the tunnel rather than through it. */
+  /**
+   * Whether Cloudflare sees a WARP connection. Only meaningful when `chained`
+   * is false — through a second hop it is always off, because the last leg is
+   * the node's own connection.
+   */
   warp: boolean;
   gateway: boolean;
+  /** Whether this was read through the second hop rather than the tunnel. */
+  chained: boolean;
 }
 
 /** Reads the exit address and country from inside the tunnel. */
