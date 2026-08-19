@@ -11,7 +11,8 @@ the `aether` crate for endpoint scanning.
 - Upstream: <https://github.com/MatinSenPai/Aether>
 - The build used here: <https://github.com/WhiteDNS/Aether> — a fork adding an embedded API, with
   upstream history preserved and every change reviewable as a diff against it
-- Licence: GNU Affero General Public License v3.0 — see `LICENSE`
+- Licence: GNU Affero General Public License v3.0 — see `LICENSE`, also installed as
+  `licenses/whiteaesther-AGPL-3.0.txt`
 - Copyright: the Aether authors
 
 Because WhiteAesther links Aether, WhiteAesther is itself a derivative work and is licensed
@@ -26,6 +27,29 @@ permission from the Aether maintainers, conditional on that repository remaining
 
 WhiteAesther is not an official Aether product and is not endorsed by the Aether project. Problems
 with WhiteAesther should be reported to WhiteDNS, not to the Aether maintainers.
+
+## mihomo
+
+The second hop behind the Exit chain feature. WhiteAesther ships the `mihomo` executable inside its
+installers and drives it over its local control API; the two are separate programs communicating
+over documented interfaces, and no mihomo code is linked into WhiteAesther.
+
+- Upstream: <https://github.com/MetaCubeX/mihomo>
+- The build shipped here: release `v1.19.30`, downloaded unmodified by `scripts/stage-chain.mjs`
+- Corresponding source: <https://github.com/MetaCubeX/mihomo/tree/v1.19.30>
+- Licence: GNU General Public License v3.0 — the full text is in `licenses/mihomo-GPL-3.0.txt`,
+  copied verbatim from that tag and installed alongside the binary
+- Copyright: the mihomo authors
+
+**Read the licence from the tag, not from the repository's front page.** The default branch of
+`MetaCubeX/mihomo` is `main`, which carries an unrelated project under an MIT licence
+("Copyright 2023 KT") — and GitHub's licence API reports *that* file, so the repository shows as
+MIT at a glance. The proxy core lives on the `Meta` branch and its releases, and `LICENSE` at
+`v1.19.30` is the GNU GPL v3. The build we distribute is GPL-3.0.
+
+Because mihomo is conveyed as a separate executable rather than linked, its licence does not extend
+to WhiteAesther's own source, which remains AGPL-3.0. GPL-3.0 still obliges us to pass the licence
+on with the binary and to say where its source is; both are above.
 
 ## Cloudflare WARP
 

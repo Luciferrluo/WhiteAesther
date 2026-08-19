@@ -6,7 +6,15 @@
  * will not search for "Reach", and someone who wants to stop DNS leaking will
  * not know the setting is called "Resolvers".
  */
-export type SectionId = "status" | "routes" | "endpoint" | "chain" | "traffic" | "identity" | "diagnostics";
+export type SectionId =
+  | "status"
+  | "routes"
+  | "endpoint"
+  | "chain"
+  | "traffic"
+  | "identity"
+  | "diagnostics"
+  | "licences";
 
 export interface SettingEntry {
   label: string;
@@ -25,6 +33,7 @@ export const SECTION_LABELS: Record<SectionId, string> = {
   traffic: "Traffic & DNS",
   identity: "Identity",
   diagnostics: "Diagnostics",
+  licences: "Licences & notices",
 };
 
 export const SETTINGS: SettingEntry[] = [
@@ -70,6 +79,9 @@ export const SETTINGS: SettingEntry[] = [
   { label: "Log detail", section: "diagnostics", where: "Diagnostics", keywords: "log level verbose trace debug info warn error" },
   { label: "Profile name", section: "diagnostics", where: "Diagnostics", keywords: "name profile label" },
   { label: "Build a report", section: "diagnostics", where: "Diagnostics", keywords: "diagnostics report share support bug redact save copy" },
+
+  { label: "Licences & notices", section: "licences", where: "Licences & notices", keywords: "licence license gpl agpl open source copyright legal notice attribution third party mihomo aether" },
+  { label: "Where the source lives", section: "licences", where: "Licences & notices", keywords: "source code repository github corresponding source obligation download" },
 ];
 
 /**
