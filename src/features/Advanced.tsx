@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  Activity, FileText, Globe, Link2, Route as RouteIcon, ShieldCheck, Wifi, type LucideIcon,
+  Activity, FileText, Globe, Link2, Route as RouteIcon, Scale, ShieldCheck, Wifi, type LucideIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,11 +15,23 @@ import { NumberField, Row, RulesField, Seg, TextField } from "./panels";
 import { Chain } from "./Chain";
 import { Scanner } from "./Scanner";
 import { transportName } from "./Simple";
+// Bundled into the app rather than read from disk at runtime: the obligation is
+// to ship these words with the binary, and a file read that can fail is not
+// that. The same text is installed beside the executable under licences/.
+import notices from "../../THIRD_PARTY_NOTICES.md?raw";
 import {
   ENDPOINT_MODES, type ConnectionProfile, type CoreLogEvent, type CoreProbe, type CoreSnapshot,
 } from "@/types";
 
-type SectionId = "status" | "routes" | "endpoint" | "chain" | "traffic" | "identity" | "diagnostics";
+type SectionId =
+  | "status"
+  | "routes"
+  | "endpoint"
+  | "chain"
+  | "traffic"
+  | "identity"
+  | "diagnostics"
+  | "licences";
 
 const SECTIONS: Array<{ group: string; items: Array<{ id: SectionId; label: string; icon: LucideIcon }> }> = [
   { group: "Connection", items: [
@@ -32,7 +44,10 @@ const SECTIONS: Array<{ group: string; items: Array<{ id: SectionId; label: stri
     { id: "traffic", label: "Traffic & DNS", icon: Wifi },
     { id: "identity", label: "Identity", icon: ShieldCheck },
   ] },
-  { group: "Support", items: [{ id: "diagnostics", label: "Diagnostics", icon: FileText }] },
+  { group: "Support", items: [
+    { id: "diagnostics", label: "Diagnostics", icon: FileText },
+    { id: "licences", label: "Licences & notices", icon: Scale },
+  ] },
 ];
 
 const BLURB: Record<SectionId, string> = {
@@ -43,6 +58,7 @@ const BLURB: Record<SectionId, string> = {
   traffic: "Where traffic goes once the tunnel is up.",
   identity: "Cloudflare Zero Trust enrolment.",
   diagnostics: "The core executable, logging, and a report you can hand to someone.",
+  licences: "What WhiteAesther is built on, under what terms, and where to get the source.",
 };
 
 export interface AdvancedProps {
@@ -130,6 +146,7 @@ export function Advanced(props: AdvancedProps) {
         {section === "traffic" && <Traffic {...props} />}
         {section === "identity" && <Identity {...props} />}
         {section === "diagnostics" && <Diagnostics {...props} />}
+        {section === "licences" && <Licences />}
       </div>
     </div>
   );
@@ -220,6 +237,63 @@ function LogList({ logs }: { logs: CoreLogEvent[] }) {
 }
 
 // ---------------------------------------------------------------------- routes
+
+/**
+ * What WhiteAesther is built on and under what terms.
+ *
+ * Aether is linked, so WhiteAesther is a derivative work and AGPL-3.0 obliges us
+ * to point at the source of the build someone is actually running. mihomo is
+ * conveyed as a separate executable under GPL-3.0, which obliges us to pass its
+ * licence on with it. Neither obligation is met by a licence file sitting in a
+ * repository nobody opens, so the text ships in the app and beside the binary.
+ */
+function Licences() {
+  return (
+    <div className="space-y-3.5">
+      <Card>
+        <CardHeader>
+          <CardTitle>What this is built on</CardTitle>
+          <CardDescription>
+            Each component below keeps its own licence. WhiteAesther&apos;s own source is public, and
+            the full licence texts are installed next to the application under{" "}
+            <code className="font-mono text-[12px]">licences/</code>.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2.5">
+          <Row first title="WhiteAesther" help="This application. Source at github.com/WhiteDNS/WhiteAesther">
+            <span className="font-mono text-[12.5px] text-muted-foreground">AGPL-3.0</span>
+          </Row>
+          <Separator />
+          <Row title="Aether" help="The connection engine, linked into this app and shipped as a binary">
+            <span className="font-mono text-[12.5px] text-muted-foreground">AGPL-3.0</span>
+          </Row>
+          <Separator />
+          <Row
+            title="mihomo"
+            help="The second hop behind Exit chain, run as a separate program. Source at github.com/MetaCubeX/mihomo at tag v1.19.30"
+          >
+            <span className="font-mono text-[12.5px] text-muted-foreground">GPL-3.0</span>
+          </Row>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Full notices</CardTitle>
+          <CardDescription>
+            The same text that ships with the installer, including trademark terms and where each
+            component&apos;s corresponding source lives.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/40 p-3.5 font-mono text-[11.5px] leading-relaxed text-muted-foreground">
+            {notices}
+          </pre>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
 
 /** The four things the core can actually be, rather than a transport toggle alone. */
 const PROTOCOLS: Array<{ id: string; label: string; detail: string; protocol: ConnectionProfile["protocol"]; transport?: "h2" | "h3" }> = [
