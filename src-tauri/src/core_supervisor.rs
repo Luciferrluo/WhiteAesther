@@ -392,6 +392,17 @@ struct Session {
     attempt: u32,
 }
 
+/// The route the operating system proxy is actually using.
+///
+/// A boolean cannot distinguish the tunnel from the second hop. That made a
+/// later request to move the machine from WARP to the chain look idempotent and
+/// get ignored, even though it was a different route with a different exit IP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyRoute {
+    Tunnel(SocketAddr),
+    Chain(SocketAddr),
+}
+
 struct SupervisorInner {
     child: Mutex<Option<Child>>,
     snapshot: Mutex<CoreSnapshot>,
@@ -400,8 +411,11 @@ struct SupervisorInner {
     /// Bumped by every start and every stop. A retry thread that wakes up on a
     /// stale generation has been superseded and does nothing.
     generation: AtomicU64,
-    /// Whether this process has the system proxy pointed at its listener.
-    proxy_applied: AtomicBool,
+    /// The listener the system proxy is currently pointed at.
+    ///
+    /// Held across an apply so two live UI commands cannot race and leave the
+    /// registry describing one route while the supervisor remembers another.
+    proxy_route: Mutex<Option<ProxyRoute>>,
     /// A reporting run of the core -- a scan or an endpoint test. Separate from
     /// `child` because it is short-lived and independently cancellable.
     scan_child: Mutex<Option<Child>>,
@@ -440,7 +454,7 @@ impl CoreSupervisor {
                 logs: Mutex::new(VecDeque::with_capacity(MAX_LOGS)),
                 session: Mutex::new(None),
                 generation: AtomicU64::new(0),
-                proxy_applied: AtomicBool::new(false),
+                proxy_route: Mutex::new(None),
                 scan_child: Mutex::new(None),
                 bridge: Mutex::new(None),
                 pending: Mutex::new(Vec::new()),
@@ -755,6 +769,7 @@ pub async fn stop_core(
 pub fn set_system_proxy(
     app: AppHandle,
     supervisor: State<'_, CoreSupervisor>,
+    chain: State<'_, Chain>,
     enabled: bool,
 ) -> Result<bool, String> {
     let inner = &supervisor.inner;
@@ -773,13 +788,36 @@ pub fn set_system_proxy(
         let snapshot = lock(&inner.snapshot);
         (snapshot.state.clone(), snapshot.socks_address.clone())
     };
+    let chain_requested = lock(&inner.session)
+        .as_ref()
+        .is_some_and(|session| session.profile.chain.enabled);
     // Before the listener exists there is nothing to point at; the connect path
     // applies it when the core reports itself up.
     if state != "connected" {
         return Ok(false);
     }
-    apply_system_proxy(&app, inner, &socks);
-    Ok(inner.proxy_applied.load(Ordering::SeqCst))
+    let tunnel_address = socks.parse::<SocketAddr>().ok();
+    if let Some(route) = desired_proxy_route(chain_requested, chain.address(), tunnel_address) {
+        apply_proxy_route(&app, inner, route);
+    } else if chain_requested {
+        // The core reports connected before mihomo has necessarily loaded its
+        // providers. Pointing the machine at WARP in that window is the race
+        // that made Whole machine keep the wrong exit after the chain became
+        // ready. The connection log path applies the final route once startup
+        // succeeds or records the chain failure before falling back.
+        supervisor_log(
+            inner,
+            "info",
+            "system proxy is waiting for the requested chain to become ready".into(),
+        );
+        return Ok(false);
+    } else {
+        // Log the parse failure with the same diagnostic used by the startup
+        // path. A valid connected snapshot always has an address, but silently
+        // doing nothing here would make corrupted state needlessly opaque.
+        let _ = tunnel_proxy_route(&socks, inner);
+    }
+    Ok(proxy_is_applied(inner))
 }
 
 /// Turns the chain on or off on a connection that is already up.
@@ -837,11 +875,22 @@ pub async fn set_chain(
     // The proxy has to follow whichever listener is now carrying traffic.
     // Leaving it pointed at the old one would send everything around the change
     // the user just made.
-    if inner.proxy_applied.load(Ordering::SeqCst) {
-        clear_system_proxy(&app, inner);
+    // Read the current intent after chain startup, which can take several
+    // seconds. Whether a proxy happened to be applied before this command is
+    // not the contract: Whole machine may deliberately be waiting for this
+    // very chain to become ready.
+    let session = lock(&inner.session);
+    if session
+        .as_ref()
+        .is_some_and(|session| session.profile.system_proxy)
+    {
         match (started, socks.as_deref()) {
-            (Some(address), _) => apply_chain_proxy(&app, inner, address),
-            (None, Some(address)) => apply_system_proxy(&app, inner, address),
+            (Some(address), _) => apply_proxy_route(&app, inner, ProxyRoute::Chain(address)),
+            (None, Some(address)) => {
+                if let Some(route) = tunnel_proxy_route(address, inner) {
+                    apply_proxy_route(&app, inner, route);
+                }
+            }
             (None, None) => {}
         }
     }
@@ -1277,7 +1326,7 @@ fn give_up(
     // a quit both restore unconditionally, so the machine can always be put back
     // by disconnecting or closing the app — and a kill rather than a close is
     // caught by the recovery pass at the next launch.
-    if profile.kill_switch && inner.proxy_applied.load(Ordering::SeqCst) {
+    if profile.kill_switch && proxy_is_applied(inner) {
         supervisor_log(
             inner,
             "warn",
@@ -1303,7 +1352,7 @@ fn handle_exit(app: &AppHandle, inner: &Arc<SupervisorInner>, generation: u64, r
     let holding = {
         let session = lock(&inner.session);
         session.as_ref().is_some_and(|current| current.profile.kill_switch)
-            && inner.proxy_applied.load(Ordering::SeqCst)
+            && proxy_is_applied(inner)
     };
     let decision = decide_exit(&mut lock(&inner.session), generation, holding);
     let (attempt, base_profile) = match decision {
@@ -1634,82 +1683,125 @@ fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: S
             match carrier.or_else(|| chain.address()) {
                 // mihomo's mixed listener speaks HTTP itself, so it is what the
                 // system proxy points at and the bridge is not needed at all.
-                Some(address) => apply_chain_proxy(app, inner, address),
-                None => apply_system_proxy(app, inner, &socks),
+                Some(address) => apply_proxy_route(app, inner, ProxyRoute::Chain(address)),
+                None => {
+                    // Reaching this branch means chain startup definitively
+                    // failed (rather than merely still being in progress), so
+                    // retain the established fallback to the live tunnel. The
+                    // failure immediately above remains visible in diagnostics.
+                    if let Some(route) = tunnel_proxy_route(&socks, inner) {
+                        apply_proxy_route(app, inner, route);
+                    }
+                }
             }
         }
     }
 }
 
-/// Points the system proxy at the chain rather than at the tunnel.
-fn apply_chain_proxy(app: &AppHandle, inner: &SupervisorInner, address: SocketAddr) {
-    if inner.proxy_applied.load(Ordering::SeqCst) {
-        return;
-    }
-    let targets = ProxyTargets { socks: address, http: address };
-    match system_proxy::apply(app, targets) {
-        Ok(()) => {
-            inner.proxy_applied.store(true, Ordering::SeqCst);
-            supervisor_log(
-                inner,
-                "info",
-                format!("system proxy set to the chain at {address}"),
-            );
-        }
-        Err(error) => supervisor_log(
-            inner,
-            "warn",
-            format!("could not set the system proxy: {error}"),
-        ),
-    }
-}
-
-/// Points the OS at the tunnel. Idempotent, so the log-line path and the
-/// change-while-connected path can both call it.
-fn apply_system_proxy(app: &AppHandle, inner: &SupervisorInner, socks: &str) {
-    if inner.proxy_applied.load(Ordering::SeqCst) {
-        return;
-    }
-    let Ok(address) = socks.parse::<SocketAddr>() else {
-        supervisor_log(
-            inner,
-            "warn",
-            format!("cannot use {socks} as a system proxy address"),
-        );
-        return;
-    };
-
-    // Windows follows an HTTP proxy and effectively ignores a SOCKS one, so the
-    // bridge is what its settings are pointed at. It costs a listener on
-    // loopback and is torn down with the proxy.
-    let bridge = match http_bridge::start(address) {
-        Ok(bridge) => bridge,
-        Err(error) => {
+/// Parses the core listener into the route used when no second hop is active.
+fn tunnel_proxy_route(socks: &str, inner: &SupervisorInner) -> Option<ProxyRoute> {
+    match socks.parse::<SocketAddr>() {
+        Ok(address) => Some(ProxyRoute::Tunnel(address)),
+        Err(_) => {
             supervisor_log(
                 inner,
                 "warn",
-                format!("could not start the local HTTP proxy: {error}"),
+                format!("cannot use {socks} as a system proxy address"),
             );
-            return;
+            None
+        }
+    }
+}
+
+/// Chooses the route for a live Whole machine request.
+///
+/// A requested chain with no address means "wait", not "use the tunnel". This
+/// distinction closes the startup race while leaving an ordinary connection
+/// free to use WARP directly.
+fn desired_proxy_route(
+    chain_requested: bool,
+    chain_address: Option<SocketAddr>,
+    tunnel_address: Option<SocketAddr>,
+) -> Option<ProxyRoute> {
+    if chain_requested {
+        chain_address.map(ProxyRoute::Chain)
+    } else {
+        tunnel_address.map(ProxyRoute::Tunnel)
+    }
+}
+
+fn proxy_is_applied(inner: &SupervisorInner) -> bool {
+    lock(&inner.proxy_route).is_some()
+}
+
+fn proxy_route_needs_update(current: Option<ProxyRoute>, requested: ProxyRoute) -> bool {
+    current != Some(requested)
+}
+
+/// Points the OS at exactly `route`, retargeting an already-applied proxy when
+/// the carrier changes.
+///
+/// [`system_proxy::apply`] preserves the original backup after its first call,
+/// so a WARP -> chain transition can be written in place. The replacement HTTP
+/// bridge is prepared first and the old one is dropped only after the registry
+/// accepts the new target, leaving no window where the selected listener is
+/// absent.
+fn apply_proxy_route(app: &AppHandle, inner: &SupervisorInner, route: ProxyRoute) {
+    let mut current = lock(&inner.proxy_route);
+    if !proxy_route_needs_update(*current, route) {
+        return;
+    }
+
+    let (targets, next_bridge) = match route {
+        ProxyRoute::Chain(address) => (
+            ProxyTargets {
+                socks: address,
+                http: address,
+            },
+            None,
+        ),
+        ProxyRoute::Tunnel(address) => {
+            // Windows follows an HTTP proxy and effectively ignores a SOCKS
+            // one, so the bridge translates WinINET traffic into SOCKS5. Other
+            // platforms use `targets.socks` and simply ignore the bridge.
+            let bridge = match http_bridge::start(address) {
+                Ok(bridge) => bridge,
+                Err(error) => {
+                    supervisor_log(
+                        inner,
+                        "warn",
+                        format!("could not start the local HTTP proxy: {error}"),
+                    );
+                    return;
+                }
+            };
+            let targets = ProxyTargets { socks: address, http: bridge.address() };
+            (targets, Some(bridge))
         }
     };
-    let targets = ProxyTargets { socks: address, http: bridge.address() };
-    *lock(&inner.bridge) = Some(bridge);
 
     match system_proxy::apply(app, targets) {
         Ok(()) => {
-            inner.proxy_applied.store(true, Ordering::SeqCst);
+            // Replace only after the OS points at `targets`; until this line an
+            // old tunnel bridge may still be serving the previous route.
+            *lock(&inner.bridge) = next_bridge;
+            *current = Some(route);
             supervisor_log(
                 inner,
                 "info",
-                format!("system proxy set to {} via {}", targets.socks, targets.http),
+                match route {
+                    ProxyRoute::Chain(address) => {
+                        format!("system proxy set to the chain at {address}")
+                    }
+                    ProxyRoute::Tunnel(address) => {
+                        format!("system proxy set to {address} via {}", targets.http)
+                    }
+                },
             );
         }
-        // Worth saying and worth continuing: the tunnel is up either way, and
-        // the SOCKS listener can still be used directly.
         Err(error) => {
-            // Nothing is pointed at the bridge, so it has no reason to stay up.
-            lock(&inner.bridge).take();
+            // `next_bridge` drops here. The previous route and bridge stay
+            // intact because the OS rejected the replacement.
             supervisor_log(
                 inner,
                 "warn",
@@ -1725,9 +1817,9 @@ fn apply_system_proxy(app: &AppHandle, inner: &SupervisorInner, socks: &str) {
 /// a proxy left pointing at a listener that no longer exists takes the machine
 /// off the network.
 fn clear_system_proxy(app: &AppHandle, inner: &SupervisorInner) {
-    // Whatever else happens, the proxy is going back, so nothing is held any
-    // more. Cleared unconditionally: the flag must never outlive the block, or
-    // the screen tells the user they are protected when they are not.
+    // The user explicitly asked to put the machine back, so the blocking state
+    // is cleared even if the platform restore later reports an error. The route
+    // itself remains recorded on failure so another cleanup can retry it.
     {
         let mut snapshot = lock(&inner.snapshot);
         if snapshot.blocking {
@@ -1735,17 +1827,20 @@ fn clear_system_proxy(app: &AppHandle, inner: &SupervisorInner) {
             mark_snapshot_dirty(inner);
         }
     }
-    if !inner.proxy_applied.swap(false, Ordering::SeqCst) {
+    let mut route = lock(&inner.proxy_route);
+    if route.is_none() {
         return;
     }
-    // Dropped before the settings change, so nothing can be sent to a bridge
-    // that is about to stop answering.
-    lock(&inner.bridge).take();
     match system_proxy::revert(app) {
-        Ok(()) => supervisor_log(inner, "info", "system proxy restored".into()),
+        Ok(()) => {
+            // Keep the bridge alive until after the OS no longer points at it.
+            lock(&inner.bridge).take();
+            *route = None;
+            supervisor_log(inner, "info", "system proxy restored".into());
+        }
         Err(error) => {
-            // Leave the flag cleared but say so loudly: the backup file stays on
-            // disk, so the next launch will try again.
+            // Keep both the route and its bridge so a later cleanup can retry
+            // and existing proxy-aware traffic is not aimed at a dead port.
             supervisor_log(
                 inner,
                 "error",
@@ -2699,6 +2794,39 @@ mod tests {
             strip_logger_prefix("ERROR gateway rejected - retrying without encryption - done"),
             "retrying without encryption - done"
         );
+    }
+
+    #[test]
+    fn whole_machine_follows_a_ready_chain_instead_of_warp() {
+        let tunnel = "127.0.0.1:1819".parse().unwrap();
+        let chain = "127.0.0.1:1820".parse().unwrap();
+        assert_eq!(
+            desired_proxy_route(true, Some(chain), Some(tunnel)),
+            Some(ProxyRoute::Chain(chain))
+        );
+    }
+
+    #[test]
+    fn whole_machine_waits_for_a_requested_chain_instead_of_leaking_to_warp() {
+        let tunnel = "127.0.0.1:1819".parse().unwrap();
+        assert_eq!(desired_proxy_route(true, None, Some(tunnel)), None);
+    }
+
+    #[test]
+    fn whole_machine_uses_warp_when_no_chain_was_requested() {
+        let tunnel = "127.0.0.1:1819".parse().unwrap();
+        assert_eq!(
+            desired_proxy_route(false, None, Some(tunnel)),
+            Some(ProxyRoute::Tunnel(tunnel))
+        );
+    }
+
+    #[test]
+    fn an_applied_warp_route_is_not_mistaken_for_the_chain() {
+        let tunnel = ProxyRoute::Tunnel("127.0.0.1:1819".parse().unwrap());
+        let chain = ProxyRoute::Chain("127.0.0.1:1820".parse().unwrap());
+        assert!(proxy_route_needs_update(Some(tunnel), chain));
+        assert!(!proxy_route_needs_update(Some(chain), chain));
     }
 
     #[test]

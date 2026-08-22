@@ -231,18 +231,21 @@ export default function App() {
     (next: CarryMode) => {
       if (next === "tun") return;
       const wantsSystem = next === "system";
-      setProfile((current) => ({ ...current, systemProxy: wantsSystem }));
+      applyProfile({ systemProxy: wantsSystem });
       // The screen offers this choice while connected, so it has to take effect
       // then, rather than only at the next connect.
       if (!desktop || !ACTIVE.has(snapshot.state)) return;
       void setSystemProxy(wantsSystem)
         .then((applied) => {
-          if (wantsSystem && applied) notify("Whole machine", "Your system proxy now points at the tunnel.");
-          else if (!wantsSystem) notify("This app only", "Your system proxy has been put back.");
+          if (wantsSystem && applied) {
+            notify("Whole machine", "Your system proxy now follows the active route.");
+          } else if (!wantsSystem) {
+            notify("This app only", "Your system proxy has been put back.");
+          }
         })
         .catch(showError);
     },
-    [desktop, snapshot.state, notify, showError],
+    [applyProfile, desktop, snapshot.state, notify, showError],
   );
 
   const retryStealth = useCallback(async () => {
