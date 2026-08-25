@@ -68,6 +68,7 @@ export const SETTINGS: SettingEntry[] = [
   { label: "Set the system proxy while connected", section: "traffic", where: "Traffic & DNS", keywords: "whole machine system proxy windows wininet browser all apps" },
   { label: "Block traffic if the tunnel drops", section: "traffic", where: "Traffic & DNS", keywords: "kill switch killswitch fail closed leak protection block traffic drop" },
   { label: "Keep me connected", section: "traffic", where: "Traffic & DNS", keywords: "auto reconnect retry keep alive stay connected reconnection" },
+  { label: "Share this connection on my network", section: "traffic", where: "Traffic & DNS", keywords: "lan share network other devices phone tv wifi hotspot proxy for phone username password" },
   { label: "Local proxy address", section: "traffic", where: "Traffic & DNS", keywords: "socks5 socks port 1819 bind listener point apps at" },
   { label: "DNS resolvers", section: "traffic", where: "Traffic & DNS", keywords: "dns resolver 1.1.1.1 leak nameserver" },
   { label: "Routing rules", section: "traffic", where: "Traffic & DNS", keywords: "route block direct bypass split tunnel exclude sites rules file" },

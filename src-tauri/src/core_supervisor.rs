@@ -14,6 +14,7 @@ use std::{
 };
 use crate::chain::{Chain, ChainSettings};
 use crate::http_bridge::{self, HttpBridge};
+use crate::lan_share::{LanDoor, LanSettings, LanStatus};
 use crate::system_proxy::{self, ProxyTargets};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -79,6 +80,10 @@ pub struct CoreProfile {
     pub auto_reconnect: bool,
     /// The second hop, and where its nodes come from.
     pub chain: ChainSettings,
+    /// Whether other devices on this network may use the tunnel, and on what
+    /// terms.
+    #[serde(default)]
+    pub lan_share: LanSettings,
     /// Leave the system proxy pointed at the dead listener when the tunnel
     /// fails, so applications that follow it fail rather than send the traffic
     /// in the clear.
@@ -113,6 +118,7 @@ impl Default for CoreProfile {
             keepalive_secs: 5,
             auto_reconnect: true,
             chain: ChainSettings::default(),
+            lan_share: LanSettings::default(),
             kill_switch: false,
             noize: "balanced".into(),
             profile_retry: true,
@@ -473,6 +479,17 @@ impl CoreSupervisor {
         (snapshot.state == "connected").then(|| snapshot.socks_address.clone())
     }
 
+    /// Whether the first hop can carry a QUIC handshake.
+    ///
+    /// MASQUE cannot and WireGuard can, and the difference is 28 bytes: see
+    /// [`crate::chain::unusable_behind_the_tunnel`]. Reported rather than
+    /// worked out in the chain, because only the supervisor knows which
+    /// transport actually came up -- a profile set to MASQUE can fall back.
+    pub fn carries_quic(&self) -> bool {
+        let snapshot = lock(&self.inner.snapshot);
+        !matches!(snapshot.transport.as_deref(), Some("masque-h2") | Some("masque-h3"))
+    }
+
     /// Records a line from something the app runs alongside the core.
     ///
     /// The chain uses this for mihomo's output. Anything with a piped stream
@@ -788,9 +805,12 @@ pub fn set_system_proxy(
         let snapshot = lock(&inner.snapshot);
         (snapshot.state.clone(), snapshot.socks_address.clone())
     };
-    let chain_requested = lock(&inner.session)
-        .as_ref()
-        .is_some_and(|session| session.profile.chain.enabled);
+    let chain_requested = chain_is_in_play(
+        chain.is_running(),
+        lock(&inner.session)
+            .as_ref()
+            .is_some_and(|session| session.profile.chain.enabled),
+    );
     // Before the listener exists there is nothing to point at; the connect path
     // applies it when the core reports itself up.
     if state != "connected" {
@@ -818,6 +838,70 @@ pub fn set_system_proxy(
         let _ = tunnel_proxy_route(&socks, inner);
     }
     Ok(proxy_is_applied(inner))
+}
+
+/// Opens or closes the door other devices on this network come in through.
+///
+/// Deliberately separate from the system proxy: that decides how far the tunnel
+/// reaches on *this* machine, and this decides whether it reaches off it at
+/// all. Sharing without credentials is allowed, because a household network
+/// where that is fine is the common case -- but it is the caller's job to have
+/// said so plainly first, and [`LanStatus::open`] carries it back so the screen
+/// can keep saying it.
+#[tauri::command]
+pub fn set_lan_share(
+    supervisor: State<'_, CoreSupervisor>,
+    chain: State<'_, Chain>,
+    door: State<'_, LanDoor>,
+    settings: LanSettings,
+) -> Result<LanStatus, String> {
+    let inner = &supervisor.inner;
+
+    // Remembered for the rest of the session, so a reconnect keeps the choice.
+    if let Some(session) = lock(&inner.session).as_mut() {
+        session.profile.lan_share = settings.clone();
+    }
+
+    if !settings.enabled {
+        door.close();
+        supervisor_log(inner, "info", "network sharing stopped".into());
+        return Ok(LanStatus::stopped());
+    }
+
+    let carrier = carrier_address(inner, &chain).ok_or(
+        "connect first: there is nothing to share until the tunnel is carrying traffic",
+    )?;
+    let status = door.open(carrier, &settings)?;
+    supervisor_log(
+        inner,
+        "info",
+        match (&status.address, status.open) {
+            (Some(address), true) => format!(
+                "network sharing open on {address} with no sign-in; anyone on this network can use it"
+            ),
+            (Some(address), false) => format!("network sharing open on {address}, sign-in required"),
+            (None, _) => "network sharing open".into(),
+        },
+    );
+    Ok(status)
+}
+
+#[tauri::command]
+pub fn lan_share_status(door: State<'_, LanDoor>) -> LanStatus {
+    door.status()
+}
+
+/// The listener traffic is actually leaving through: the second hop when one is
+/// running, the tunnel when it is not, and nothing at all when disconnected.
+fn carrier_address(inner: &SupervisorInner, chain: &Chain) -> Option<SocketAddr> {
+    if let Some(address) = chain.address() {
+        return Some(address);
+    }
+    let snapshot = lock(&inner.snapshot);
+    if snapshot.state != "connected" {
+        return None;
+    }
+    snapshot.socks_address.parse().ok()
 }
 
 /// Turns the chain on or off on a connection that is already up.
@@ -871,6 +955,13 @@ pub async fn set_chain(
         chain.stop();
         None
     };
+
+    // Anything pointed at the old listener would go around the change the user
+    // just made -- devices on the network included, which is why the shared
+    // door is retargeted rather than left to be reconfigured by hand.
+    if let Some(carrier) = started.or_else(|| tunnel) {
+        app.state::<LanDoor>().retarget(carrier);
+    }
 
     // The proxy has to follow whichever listener is now carrying traffic.
     // Leaving it pointed at the old one would send everything around the change
@@ -1626,14 +1717,18 @@ fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: S
     // fresh problem and gets the full retry budget again. Kept out of the
     // snapshot lock above so the two are never held at once.
     if connected {
-        let (wanted, chain_settings) = {
+        let (wanted, chain_settings, lan) = {
             let mut guard = lock(&inner.session);
             match guard.as_mut() {
                 Some(session) => {
                     session.attempt = 0;
-                    (session.profile.system_proxy, session.profile.chain.clone())
+                    (
+                        session.profile.system_proxy,
+                        session.profile.chain.clone(),
+                        session.profile.lan_share.clone(),
+                    )
                 }
-                None => (false, ChainSettings::default()),
+                None => (false, ChainSettings::default(), LanSettings::default()),
             }
         };
 
@@ -1679,6 +1774,35 @@ fn record_log(app: &AppHandle, inner: &SupervisorInner, stream: &str, message: S
             None
         };
 
+        // Whether or not this machine's own proxy is being pointed anywhere,
+        // a device on the network that was already sharing must not be left
+        // aimed at the listener from the previous session.
+        if let Some(address) = carrier.or_else(|| chain.address()).or_else(|| socks.parse().ok()) {
+            let door = app.state::<LanDoor>();
+            door.retarget(address);
+            // Reconnecting, or starting the app with sharing already switched
+            // on, has to put the door back. Leaving it to the screen would mean
+            // the setting only took effect if someone opened that panel.
+            if lan.enabled && !door.status().running {
+                match door.open(address, &lan) {
+                    Ok(status) => supervisor_log(
+                        inner,
+                        "info",
+                        match (&status.address, status.open) {
+                            (Some(at), true) => format!(
+                                "network sharing open on {at} with no sign-in; anyone on this network can use it"
+                            ),
+                            (Some(at), false) => format!("network sharing open on {at}, sign-in required"),
+                            (None, _) => "network sharing open".into(),
+                        },
+                    ),
+                    Err(error) => {
+                        supervisor_log(inner, "warn", format!("could not share on this network: {error}"))
+                    }
+                }
+            }
+        }
+
         if wanted {
             match carrier.or_else(|| chain.address()) {
                 // mihomo's mixed listener speaks HTTP itself, so it is what the
@@ -1711,6 +1835,18 @@ fn tunnel_proxy_route(socks: &str, inner: &SupervisorInner) -> Option<ProxyRoute
             None
         }
     }
+}
+
+/// Whether a second hop is what traffic should be following right now.
+///
+/// A chain that is already listening settles this on its own, whatever the
+/// profile says. Asking the profile alone let the two disagree, and when they
+/// did, "this app only" named the chain's listener while "whole machine"
+/// pointed the machine at WARP -- one browser, two exit addresses, decided by a
+/// switch that is supposed to change how far the tunnel reaches and not where
+/// it comes out.
+fn chain_is_in_play(chain_running: bool, chain_enabled: bool) -> bool {
+    chain_running || chain_enabled
 }
 
 /// Chooses the route for a live Whole machine request.
@@ -1986,8 +2122,12 @@ fn parse_latency_ms(message: &str) -> Option<f64> {
 
 fn stop_inner(inner: &SupervisorInner, app: &AppHandle) -> Result<(), String> {
     // The chain exists only to carry a live tunnel's traffic; without one it
-    // would sit there dialling a SOCKS port nothing is answering on.
+    // would sit there dialling a SOCKS port nothing is answering on. The same
+    // is true of the door other devices come in through: left open over a dead
+    // tunnel it is a machine on the network that accepts connections and then
+    // fails every one of them.
     app.state::<Chain>().stop();
+    app.state::<LanDoor>().close();
     // Invalidate first. A retry sleeping out its backoff has no child to kill,
     // and would otherwise launch a process after the user asked it to stop.
     inner.generation.fetch_add(1, Ordering::SeqCst);
@@ -2804,6 +2944,17 @@ mod tests {
             desired_proxy_route(true, Some(chain), Some(tunnel)),
             Some(ProxyRoute::Chain(chain))
         );
+    }
+
+    #[test]
+    fn a_listening_chain_counts_as_requested_whatever_the_profile_says() {
+        // The two can disagree: the chain is started from its own screen and
+        // the carry mode is read from the session profile. When they did, Whole
+        // machine sent the OS to WARP while the very same connection was being
+        // advertised to applications as the chain's port.
+        assert!(chain_is_in_play(true, false));
+        assert!(chain_is_in_play(false, true));
+        assert!(!chain_is_in_play(false, false));
     }
 
     #[test]

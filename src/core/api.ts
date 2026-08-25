@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { ChainSettings, ConnectionProfile, CoreLogEvent, CoreProbe, CoreSnapshot } from "../types";
+import type { ChainSettings, ConnectionProfile, LanSettings, CoreLogEvent, CoreProbe, CoreSnapshot } from "../types";
 
 export function isDesktopRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -172,6 +172,14 @@ export interface ChainNode {
   kind: string;
   /** Milliseconds through the tunnel, or null when the last test failed. */
   delay: number | null;
+  /**
+   * Why this node cannot work as things are set up, when it cannot.
+   *
+   * Set for QUIC protocols while the nodes are dialled through the tunnel: the
+   * handshake needs a bigger packet than the tunnel carries, so a measurement
+   * would fail however healthy the node is.
+   */
+  unusable: string | null;
 }
 
 /**
@@ -186,6 +194,31 @@ export async function setChain(settings: ChainSettings): Promise<boolean> {
 export async function chainStatus(): Promise<ChainStatus> {
   requireDesktop();
   return invoke("chain_status");
+}
+
+/** Where another device points, and on what terms. */
+export interface LanStatus {
+  running: boolean;
+  /** The address to type into the other device, e.g. `192.168.1.24:1080`. */
+  address: string | null;
+  /** Running with no sign-in: anyone on this network can use the tunnel. */
+  open: boolean;
+}
+
+/**
+ * Opens or closes the door other devices come in through.
+ *
+ * Takes effect immediately rather than at the next connect, because the person
+ * flipping it is usually standing next to the device they are configuring.
+ */
+export async function setLanShare(settings: LanSettings): Promise<LanStatus> {
+  requireDesktop();
+  return invoke("set_lan_share", { settings });
+}
+
+export async function lanShareStatus(): Promise<LanStatus> {
+  requireDesktop();
+  return invoke("lan_share_status");
 }
 
 export async function chainNodes(): Promise<ChainNode[]> {

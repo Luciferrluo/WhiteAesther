@@ -5,18 +5,19 @@ licence, and those licences are not superseded by WhiteAesther's.
 
 ## Aether
 
-The connection engine. WhiteAesther ships the `aether` executable inside its installers and links
-the `aether` crate for endpoint scanning.
+The connection engine. WhiteAesther ships the `aether` executable inside its installers and runs it
+to connect, and in a reporting mode to populate the endpoint picker.
 
-- Upstream: <https://github.com/MatinSenPai/Aether>
-- The build used here: <https://github.com/WhiteDNS/Aether> — a fork adding an embedded API, with
-  upstream history preserved and every change reviewable as a diff against it
+- Upstream: <https://github.com/CluvexStudio/Aether> — version 1.7.0
+- The build used here: <https://github.com/WhiteDNS/Aether> at tag `v1.7.0-whiteaesther.1` — a fork
+  adding the two reporting modes the endpoint picker needs, with upstream history preserved and
+  every change reviewable as a diff against it
 - Licence: GNU Affero General Public License v3.0 — see `LICENSE`, also installed as
   `licenses/whiteaesther-AGPL-3.0.txt`
 - Copyright: the Aether authors
 
-Because WhiteAesther links Aether, WhiteAesther is itself a derivative work and is licensed
-AGPL-3.0. Its complete source is public at <https://github.com/WhiteDNS/WhiteAesther>.
+Because WhiteAesther is built around Aether and distributes it, WhiteAesther is treated as a
+derivative work and is licensed AGPL-3.0. Its complete source is public at <https://github.com/WhiteDNS/WhiteAesther>.
 
 ### Trademark
 

@@ -126,6 +126,16 @@ function settingsLine(profile: ConnectionProfile): string {
     ["zeroTrust", Boolean(profile.team?.trim())],
     ["gateway", profile.gateway],
     ["systemProxy", profile.systemProxy],
+    // Whether the machine is a door onto the tunnel for the rest of the
+    // network, and whether that door asks for anything. Never the credentials
+    // themselves: this file gets handed to other people.
+    ["lanShare", profile.lanShare.enabled],
+    [
+      "lanShareSignIn",
+      profile.lanShare.enabled
+        ? Boolean(profile.lanShare.username.trim() && profile.lanShare.password.trim())
+        : false,
+    ],
   ];
   return `settings ${values.map(([key, value]) => `${key}=${value}`).join(" ")}`;
 }
