@@ -10,7 +10,7 @@ import { Switch } from "@/components/ui/switch";
 import { buildCoreCommand } from "@/core/command";
 import { endpointError, normalizeEndpoint } from "@/core/endpoint";
 import { REPORT_EVENT_LIMIT, buildReport, reportFilename } from "@/core/report";
-import { saveReport } from "@/core/api";
+import { type LanStatus, lanShareStatus, saveReport, setLanShare } from "@/core/api";
 import { NumberField, Row, RulesField, Seg, TextField } from "./panels";
 import { Chain } from "./Chain";
 import { Scanner } from "./Scanner";
@@ -20,7 +20,7 @@ import { transportName } from "./Simple";
 // that. The same text is installed beside the executable under licences/.
 import notices from "../../THIRD_PARTY_NOTICES.md?raw";
 import {
-  ENDPOINT_MODES, type ConnectionProfile, type CoreLogEvent, type CoreProbe, type CoreSnapshot,
+  ENDPOINT_MODES, type ConnectionProfile, type LanSettings, type CoreLogEvent, type CoreProbe, type CoreSnapshot,
 } from "@/types";
 
 type SectionId =
@@ -264,7 +264,7 @@ function Licences() {
             <span className="font-mono text-[12.5px] text-muted-foreground">AGPL-3.0</span>
           </Row>
           <Separator />
-          <Row title="Aether" help="The connection engine, linked into this app and shipped as a binary">
+          <Row title="Aether" help="The connection engine, shipped as a binary and run by this app. Aether 1.7.0">
             <span className="font-mono text-[12.5px] text-muted-foreground">AGPL-3.0</span>
           </Row>
           <Separator />
@@ -547,7 +547,7 @@ function Endpoint({ profile, onChange, snapshot, onToast }: AdvancedProps) {
 
 // --------------------------------------------------------------------- traffic
 
-function Traffic({ profile, onChange, runtime }: AdvancedProps) {
+function Traffic({ profile, onChange, runtime, snapshot, onToast }: AdvancedProps) {
   const set = (patch: Partial<ConnectionProfile>) => onChange({ ...profile, ...patch });
   return (
     <>
@@ -594,6 +594,13 @@ function Traffic({ profile, onChange, runtime }: AdvancedProps) {
         </CardContent>
       </Card>
 
+      <LanSharing
+        profile={profile}
+        onChange={onChange}
+        connected={snapshot.state === "connected"}
+        onToast={onToast}
+      />
+
       <Card>
         <CardHeader className="pb-1">
           <CardTitle className="text-[15px]">Routing rules</CardTitle>
@@ -623,6 +630,159 @@ function Traffic({ profile, onChange, runtime }: AdvancedProps) {
         </CardContent>
       </Card>
     </>
+  );
+}
+
+/**
+ * Sharing this machine's tunnel with the rest of the network.
+ *
+ * The switch is the whole feature and the warning is half of it: a proxy on a
+ * network port is a proxy anyone on that network can use, and on a café or
+ * office network that is everyone. Sign-in is optional because a home network
+ * where it does not matter is the common case -- but the consequence is stated
+ * on screen while it is off, not buried in a help line nobody opens.
+ */
+function LanSharing({
+  profile,
+  onChange,
+  connected,
+  onToast,
+}: {
+  profile: ConnectionProfile;
+  onChange: (profile: ConnectionProfile) => void;
+  connected: boolean;
+  onToast: (title: string, message: string, error?: boolean) => void;
+}) {
+  const share = profile.lanShare;
+  const [status, setStatus] = useState<LanStatus>({ running: false, address: null, open: false });
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    lanShareStatus().then(setStatus).catch(() => setStatus({ running: false, address: null, open: false }));
+  }, [connected]);
+
+  /**
+   * Saves and applies together. A port or a password that was typed but never
+   * reached the listener is the worst of both: the screen says one thing and
+   * the open port does another.
+   */
+  const apply = async (patch: Partial<LanSettings>) => {
+    const next = { ...share, ...patch };
+    onChange({ ...profile, lanShare: next });
+    if (!connected && next.enabled) return;
+    setBusy(true);
+    try {
+      setStatus(await setLanShare(next));
+    } catch (error) {
+      // Put the switch back: it must not sit on over a door that never opened.
+      onChange({ ...profile, lanShare: { ...next, enabled: false } });
+      setStatus({ running: false, address: null, open: false });
+      onToast("Could not share", error instanceof Error ? error.message : String(error), true);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader className="pb-1">
+        <CardTitle className="text-[15px]">Share with other devices</CardTitle>
+        <CardDescription>
+          Opens a proxy on this machine that phones, televisions and anything else on the same
+          network can point at. They go out through whatever is carrying traffic here — the second
+          hop when one is running, the tunnel when it is not.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="pt-0">
+        <Row
+          first
+          title="Share this connection on my network"
+          help={
+            connected
+              ? "The port is opened while connected and closed when you disconnect."
+              : "Connect first — there is nothing to share until the tunnel is carrying traffic."
+          }
+        >
+          <Switch
+            checked={share.enabled}
+            disabled={busy || (!connected && !share.enabled)}
+            onCheckedChange={(enabled) => void apply({ enabled })}
+          />
+        </Row>
+
+        {share.enabled ? (
+          <>
+            <div className="grid grid-cols-3 gap-4 py-3">
+              <TextField
+                label="Port"
+                mono
+                value={String(share.port)}
+                onChange={(value) => {
+                  const port = Number(value.replace(/[^0-9]/g, ""));
+                  onChange({
+                    ...profile,
+                    lanShare: { ...share, port: Number.isFinite(port) ? port : 0 },
+                  });
+                }}
+                help="Typed into the other device."
+              />
+              <TextField
+                label="Username"
+                value={share.username}
+                onChange={(username) => onChange({ ...profile, lanShare: { ...share, username } })}
+                help="Optional."
+              />
+              <TextField
+                label="Password"
+                value={share.password}
+                onChange={(password) => onChange({ ...profile, lanShare: { ...share, password } })}
+                help="Optional."
+              />
+            </div>
+
+            {!share.username.trim() || !share.password.trim() ? (
+              <div className="mb-3 rounded-lg border border-amber-500/40 bg-amber-500/[0.08] p-3">
+                <div className="text-[12.5px] font-semibold text-amber-500">
+                  No sign-in: anyone on this network can use your tunnel
+                </div>
+                <div className="mt-1 text-[12px] text-muted-foreground">
+                  Every device that can reach this machine — including guests and anything else on a
+                  shared or public network — can send traffic through your connection, and it will
+                  leave from your exit address. Fill in both a username and a password to require a
+                  sign-in.
+                </div>
+              </div>
+            ) : null}
+
+            <div className="flex items-center justify-between gap-4 border-t pt-3">
+              <div className="min-w-0">
+                <div className="text-[13px] font-medium">
+                  {status.running ? "Open" : "Not open"}
+                </div>
+                <div className="truncate font-mono text-[11.5px] text-muted-foreground">
+                  {status.running && status.address
+                    ? `Point devices at ${status.address} — HTTP or SOCKS5, same port`
+                    : "Apply to open the port."}
+                </div>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={busy || !connected}
+                onClick={() => void apply({})}
+              >
+                Apply
+              </Button>
+            </div>
+
+            <p className="pt-2 text-[12px] text-muted-foreground">
+              Windows asks to allow this the first time. Until you say yes, the port answers on this
+              machine only.
+            </p>
+          </>
+        ) : null}
+      </CardContent>
+    </Card>
   );
 }
 

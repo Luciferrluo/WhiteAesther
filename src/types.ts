@@ -30,6 +30,19 @@ export interface ChainSettings {
   node: string | null;
 }
 
+/** Sharing this machine's tunnel with other devices on the same network. */
+export interface LanSettings {
+  enabled: boolean;
+  /** The port another device is pointed at. */
+  port: number;
+  /**
+   * Both empty means no sign-in at all — anyone who can reach this machine on
+   * the network can use the tunnel. Allowed on purpose; the screen says so.
+   */
+  username: string;
+  password: string;
+}
+
 export interface ConnectionProfile {
   name: string;
   protocol: "masque" | "wg" | "gool";
@@ -74,6 +87,8 @@ export interface ConnectionProfile {
   autoReconnect: boolean;
   /** The second hop that changes the exit address. Off unless configured. */
   chain: ChainSettings;
+  /** Whether other devices on this network may use the tunnel. */
+  lanShare: LanSettings;
   /** Leave the system proxy on a dead tunnel so apps fail rather than leak. */
   killSwitch: boolean;
 }
@@ -152,6 +167,7 @@ export const DEFAULT_PROFILE: ConnectionProfile = {
   systemProxy: false,
   autoReconnect: true,
   chain: { enabled: false, throughTunnel: true, sources: [], manual: "", node: null },
+  lanShare: { enabled: false, port: 1080, username: "", password: "" },
   killSwitch: false,
 };
 

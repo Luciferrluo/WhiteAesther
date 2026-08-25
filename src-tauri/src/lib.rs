@@ -1,6 +1,7 @@
 mod chain;
 mod core_supervisor;
 mod http_bridge;
+mod lan_share;
 mod latency;
 mod scanner;
 mod system_proxy;
@@ -33,8 +34,13 @@ async fn chain_status(chain: tauri::State<'_, Chain>) -> Result<ChainStatus, Str
 
 /// Every node the chain knows about, with the delay each last recorded.
 #[tauri::command]
-async fn chain_nodes(chain: tauri::State<'_, Chain>) -> Result<Vec<chain::ChainNode>, String> {
-    chain.nodes()
+async fn chain_nodes(
+    chain: tauri::State<'_, Chain>,
+    supervisor: tauri::State<'_, CoreSupervisor>,
+) -> Result<Vec<chain::ChainNode>, String> {
+    // Which transport came up decides whether a QUIC node behind the tunnel can
+    // work at all, and only the supervisor knows that.
+    chain.nodes(supervisor.carries_quic())
 }
 
 /// Measures one node through the tunnel.
@@ -86,6 +92,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(CoreSupervisor::new())
         .manage(Chain::new())
+        .manage(lan_share::LanDoor::default())
         .setup(|app| {
             // A previous run that was killed rather than closed may have left
             // the system proxy pointing at a listener that is now gone, which
@@ -199,6 +206,8 @@ pub fn run() {
             core_supervisor::save_report,
             core_supervisor::set_system_proxy,
             core_supervisor::set_chain,
+            core_supervisor::set_lan_share,
+            core_supervisor::lan_share_status,
             scanner::scan_endpoints,
             scanner::test_endpoint,
             scanner::cancel_scan,

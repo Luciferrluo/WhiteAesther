@@ -19,9 +19,10 @@
 //! - a node blocked from this network is still reachable, because it is reached
 //!   from Cloudflare's network rather than from here.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -100,6 +101,14 @@ pub struct Running {
     pub mixed: SocketAddr,
     api: SocketAddr,
     secret: String,
+    /// Whether the nodes are dialled from inside the tunnel. Decides which
+    /// protocols can work at all -- see [`unusable_behind_the_tunnel`].
+    through_tunnel: bool,
+    /// The chain directory, so the node list can read back what the
+    /// subscriptions actually contained. mihomo's API reports a protocol and a
+    /// name and nothing about REALITY, and REALITY is the one thing this
+    /// engine cannot use.
+    home: PathBuf,
 }
 
 #[derive(Default)]
@@ -117,6 +126,13 @@ pub struct ChainNode {
     pub kind: String,
     /// Milliseconds through the tunnel, or None when the last test failed.
     pub delay: Option<u32>,
+    /// Why this node cannot work as things are set up, when it cannot.
+    ///
+    /// A measurement that was never going to succeed is worse than no
+    /// measurement: it reads as "this node is down" and sends people off to
+    /// find a better one, when the node is fine and the route in front of it
+    /// is what cannot carry it.
+    pub unusable: Option<String>,
 }
 
 impl Chain {
@@ -164,6 +180,13 @@ impl Chain {
             .join("chain");
         std::fs::create_dir_all(home.join("providers"))
             .map_err(|error| format!("cannot prepare the chain directory: {error}"))?;
+        prune_provider_cache(
+            &home.join("providers"),
+            &usable
+                .iter()
+                .map(|source| provider_cache(&source.url))
+                .collect::<Vec<_>>(),
+        );
 
         // The mixed port is an address a person types into a browser, so it has
         // to be the same one tomorrow. An ephemeral port meant every launch
@@ -245,7 +268,14 @@ impl Chain {
 
         let mixed_address = SocketAddr::from((Ipv4Addr::LOCALHOST, mixed));
         *self.running.lock().map_err(|_| "the chain lock is poisoned")? =
-            Some(Running { child, mixed: mixed_address, api: api_address, secret });
+            Some(Running {
+            child,
+            mixed: mixed_address,
+            api: api_address,
+            secret,
+            through_tunnel: settings.through_tunnel,
+            home: home.clone(),
+        });
         Ok(mixed_address)
     }
 
@@ -260,8 +290,18 @@ impl Chain {
     }
 
     /// Every node from every source, with the delay each last recorded.
-    pub fn nodes(&self) -> Result<Vec<ChainNode>, String> {
+    pub fn nodes(&self, carries_quic: bool) -> Result<Vec<ChainNode>, String> {
         let (api, secret) = self.control()?;
+        let (through_tunnel, home) = {
+            let guard = self.running.lock().map_err(|_| "the chain lock is poisoned")?;
+            match guard.as_ref() {
+                Some(running) => (running.through_tunnel, Some(running.home.clone())),
+                None => (false, None),
+            }
+        };
+        // Read once for the whole list rather than per node: it is one small
+        // file per subscription and the answer is the same for every entry.
+        let reality = home.as_deref().map(reality_nodes).unwrap_or_default();
         let body = get(api, &secret, "/providers/proxies")?;
         let parsed: serde_json::Value = serde_json::from_str(&body)
             .map_err(|error| format!("the chain sent something unreadable: {error}"))?;
@@ -283,10 +323,19 @@ impl Chain {
                 let Some(name) = proxy.get("name").and_then(|v| v.as_str()) else {
                     continue;
                 };
+                let kind = proxy.get("type").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                let blocked = if reality.contains(name) {
+                    Some(REALITY_UNSUPPORTED.to_string())
+                } else if through_tunnel && !carries_quic {
+                    unusable_behind_the_tunnel(&kind)
+                } else {
+                    None
+                };
                 nodes.push(ChainNode {
+                    unusable: blocked,
                     name: name.to_string(),
                     source: source.clone(),
-                    kind: proxy.get("type").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                    kind,
                     delay: proxy
                         .get("history")
                         .and_then(|v| v.as_array())
@@ -347,6 +396,163 @@ impl Chain {
     }
 }
 
+/// Said against every REALITY node, because this build cannot use one.
+///
+/// mihomo's REALITY client does not authenticate against current Xray servers:
+/// the handshake completes, the server falls back to the site it borrows its
+/// certificate from, and the connection is refused. Checked against a real
+/// subscription -- three nodes, three different keys, all refused here and all
+/// answering in under a second under Xray. Saying so is the honest thing; a
+/// node that silently never works is worse than one labelled.
+const REALITY_UNSUPPORTED: &str =
+    "REALITY is not supported yet: the engine this build uses cannot authenticate with it. \
+The node is fine -- it will work again here once the engine can.";
+
+/// The node names in this chain's sources that use REALITY.
+///
+/// Read from the files mihomo was given rather than from mihomo, which reports
+/// a name and a protocol and nothing about how the node secures itself. Both
+/// shapes a provider file arrives in are covered: a base64 block of URIs, which
+/// is what most panels serve, and a Clash document.
+fn reality_nodes(home: &Path) -> HashSet<String> {
+    let mut found = HashSet::new();
+    let Ok(entries) = std::fs::read_dir(home.join("providers")) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        collect_reality_names(&decode_if_base64(&raw), &mut found);
+    }
+    found
+}
+
+/// Subscriptions arrive base64-encoded as often as not.
+fn decode_if_base64(raw: &str) -> String {
+    let compact: String = raw.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    if compact.is_empty() || compact.contains("://") || compact.contains(':') {
+        return raw.to_string();
+    }
+    match base64_decode(&compact) {
+        Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        None => raw.to_string(),
+    }
+}
+
+fn collect_reality_names(body: &str, into: &mut HashSet<String>) {
+    // A Clash document names the node on one line and its REALITY settings on
+    // the same one, because these files are written as flow mappings.
+    for line in body.lines() {
+        if line.contains("reality-opts") {
+            if let Some(name) = clash_name(line) {
+                into.insert(name);
+            }
+            continue;
+        }
+        // A URI carries its parameters in the query and its name in the
+        // fragment.
+        let Some((head, name)) = line.rsplit_once('#') else {
+            continue;
+        };
+        if head.contains("security=reality") {
+            into.insert(percent_decode(name.trim()));
+        }
+    }
+}
+
+fn clash_name(line: &str) -> Option<String> {
+    let after = line.split("name:").nth(1)?;
+    let name = after
+        .split(',')
+        .next()?
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_end_matches('}')
+        .trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The inverse of [`encode`], for names that arrive from a subscription.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    const INVALID: u8 = 64;
+    let value = |c: u8| -> u8 {
+        match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            // Both alphabets: panels serve either, and a subscription that
+            // failed to decode would silently look like it had no REALITY.
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => INVALID,
+        }
+    };
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut buffer = 0_u32;
+    let mut held = 0;
+    for byte in input.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let bits = value(byte);
+        if bits == INVALID {
+            return None;
+        }
+        buffer = (buffer << 6) | u32::from(bits);
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            out.push((buffer >> held) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Why a protocol cannot be carried when the nodes are dialled through the
+/// tunnel, or `None` when it can.
+///
+/// QUIC is the whole of it. A QUIC handshake opens with a datagram padded to
+/// 1280 bytes, which is 1308 bytes once the IP and UDP headers are on it, and
+/// the tunnel cannot carry a packet that size: Cloudflare's connect-ip capsule
+/// tops out at 1306 bytes of inner packet, measured on a live connection. Every
+/// handshake attempt is therefore dropped before it leaves, which shows up as a
+/// node that "does not answer" no matter how healthy it is -- both ends were
+/// checked here, and the same node answers in 800ms when it is dialled
+/// directly.
+///
+/// Matched on the protocol names mihomo reports, lowercased.
+fn unusable_behind_the_tunnel(kind: &str) -> Option<String> {
+    matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "hysteria" | "hysteria2" | "tuic"
+    )
+    .then(|| {
+        format!(
+            "{kind} runs over QUIC, which needs a bigger packet than a MASQUE tunnel can carry. Switch the protocol to WireGuard under Routes and transports, or turn off \"Dial nodes through the tunnel\" there."
+        )
+    })
+}
+
 impl Drop for Chain {
     fn drop(&mut self) {
         self.stop();
@@ -358,6 +564,17 @@ impl Drop for Chain {
 /// `dialer-proxy` is set per provider rather than per node, which is what lets
 /// a subscription of any size arrive without us parsing or rewriting a single
 /// entry: every node it carries inherits the tunnel.
+///
+/// `proxy` is a different question and has to be answered differently. It names
+/// the route mihomo fetches the subscription *itself* over, and leaving it
+/// unset sends that request through the rules -- which is `MATCH,exit`, so the
+/// only way to learn about the nodes was to already be running through one of
+/// them. On this subscription that failed every time (`pull error: ... EOF`),
+/// and a provider that cannot refresh keeps serving whatever it cached last,
+/// which is how the list ended up one node long and belonging to a subscription
+/// the user had already replaced. Pointing the fetch at the tunnel is what
+/// makes it independent of the hop it is trying to configure, and it still
+/// never leaves the machine in the clear.
 fn render(
     tunnel: Option<SocketAddr>,
     mixed: u16,
@@ -387,16 +604,19 @@ fn render(
 
     // Declared only when there is a tunnel to declare. A socks5 proxy pointing
     // at a port nothing is listening on would fail every node it fronted.
-    let through = match tunnel {
+    let (through, fetch_through) = match tunnel {
         Some(address) => {
             config.push_str(&format!(
                 "proxies:\n  - {{name: {TUNNEL_PROXY}, type: socks5, server: {}, port: {}, udp: true}}\n",
                 address.ip(),
                 address.port()
             ));
-            format!("\n    dialer-proxy: {TUNNEL_PROXY}")
+            (
+                format!("\n    dialer-proxy: {TUNNEL_PROXY}"),
+                format!("\n    proxy: {TUNNEL_PROXY}"),
+            )
         }
-        None => String::new(),
+        None => (String::new(), String::new()),
     };
 
     let mut names: Vec<String> = Vec::new();
@@ -408,10 +628,11 @@ fn render(
         names.push(key.clone());
         config.push_str(&format!(
             "  {key}:\n    type: http\n    url: {}\n    interval: 3600\n    \
-             path: ./providers/{key}.yaml{through}\n    \
+             path: ./providers/{}.yaml{fetch_through}{through}\n    \
              health-check: {{enable: true, url: \"http://www.gstatic.com/generate_204\", \
              interval: 300, lazy: true}}\n",
-            serde_json::to_string(&source.url).unwrap_or_default()
+            serde_json::to_string(&source.url).unwrap_or_default(),
+            provider_cache(&source.url),
         ));
     }
     if !manual.trim().is_empty() {
@@ -468,6 +689,48 @@ const DEFAULT_MIXED_PORT: u16 = 1820;
 /// One above the tunnel's own port, so the two read as a pair.
 fn next_port(tunnel: SocketAddr) -> u16 {
     tunnel.port().checked_add(1).unwrap_or(DEFAULT_MIXED_PORT)
+}
+
+/// The cache file a subscription's nodes are kept in, named after the URL.
+///
+/// Named after the position in the list, they were not: a user who replaced a
+/// subscription got a provider pointed at the new URL and a cache file left
+/// over from the old one, and every failed refresh served the previous
+/// subscription's nodes as though they were the new ones. A name derived from
+/// the URL cannot collide that way -- a different subscription is a different
+/// file, and an unreadable new one shows as empty rather than as someone
+/// else's.
+fn provider_cache(url: &str) -> String {
+    // FNV-1a. Not a security boundary -- this only has to be stable across runs
+    // and safe to put in a path.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in url.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Deletes cache files for subscriptions that are no longer configured.
+///
+/// Without this the directory only ever grows, and a subscription removed today
+/// leaves its nodes on disk to be picked up if its URL is ever added back.
+fn prune_provider_cache(directory: &std::path::Path, keep: &[String]) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("yaml") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !keep.iter().any(|name| name == stem) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Takes `want` when it is free, and any free port when it is not.
@@ -678,6 +941,49 @@ mod tests {
     }
 
     #[test]
+    fn a_subscription_is_fetched_over_the_tunnel_not_over_the_hop_it_configures() {
+        // Left to the rules, the fetch matched MATCH,exit and went out through
+        // a node -- so the node list could only be refreshed by a node already
+        // in it. Every refresh failed, the provider kept serving its last
+        // cache, and the screen showed one stale node out of seven.
+        let sources = [source("ours", "https://example.com/a")];
+        let refs: Vec<&ChainSource> = sources.iter().collect();
+        let config = render(tunnel(), 1820, 1821, "s", &refs, "");
+        assert!(config.contains("\n    proxy: aether"), "the fetch must name the tunnel");
+        // And the nodes it carries still dial through the tunnel: these are two
+        // different routes and setting one must not have replaced the other.
+        assert!(config.contains("\n    dialer-proxy: aether"));
+    }
+
+    #[test]
+    fn without_a_tunnel_the_fetch_names_no_proxy_at_all() {
+        let sources = [source("ours", "https://example.com/a")];
+        let refs: Vec<&ChainSource> = sources.iter().collect();
+        let config = render(None, 1820, 1821, "s", &refs, "");
+        assert!(!config.contains("proxy: aether"), "there is no tunnel to fetch through");
+    }
+
+    #[test]
+    fn a_replaced_subscription_cannot_serve_the_previous_one_s_nodes() {
+        // The cache file used to be named after the position in the list, so a
+        // new URL inherited the old URL's nodes and served them whenever it
+        // could not refresh.
+        let old = [source("ours", "https://example.com/old")];
+        let new = [source("ours", "https://example.com/new")];
+        let old_config = render(tunnel(), 1820, 1821, "s", &old.iter().collect::<Vec<_>>(), "");
+        let new_config = render(tunnel(), 1820, 1821, "s", &new.iter().collect::<Vec<_>>(), "");
+        let path_of = |config: &str| {
+            config
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("path: ").map(ToString::to_string))
+                .expect("a provider path")
+        };
+        assert_ne!(path_of(&old_config), path_of(&new_config));
+        // Same URL, same file: a restart has to find what it already pulled.
+        assert_eq!(provider_cache("https://example.com/old"), provider_cache("https://example.com/old"));
+    }
+
+    #[test]
     fn nothing_is_allowed_to_take_a_direct_route() {
         let config = render(tunnel(), 1820, 1821, "s", &[], "vless://pasted");
         assert!(config.contains("MATCH,exit"));
@@ -727,6 +1033,99 @@ mod tests {
         // Everything else must still hold: no direct rule, DNS inside the chain.
         assert!(config.contains("MATCH,exit"));
         assert!(config.contains("enhanced-mode: fake-ip"));
+    }
+
+    #[test]
+    fn a_cache_for_a_subscription_that_is_gone_is_deleted() {
+        let directory = std::env::temp_dir().join(format!("whiteaesther-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let keep = provider_cache("https://example.com/keep");
+        for name in [format!("{keep}.yaml"), "0123456789abcdef.yaml".to_string()] {
+            std::fs::write(directory.join(name), "proxies: []").unwrap();
+        }
+        // Pasted configs are not a subscription cache and must survive.
+        std::fs::write(directory.join("manual.txt"), "vless://x").unwrap();
+
+        prune_provider_cache(&directory, std::slice::from_ref(&keep));
+
+        assert!(directory.join(format!("{keep}.yaml")).exists());
+        assert!(!directory.join("0123456789abcdef.yaml").exists());
+        assert!(directory.join("manual.txt").exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn quic_protocols_are_named_as_unusable_behind_the_tunnel() {
+        // Measured on a live connection: Cloudflare's connect-ip capsule carries
+        // 1306 bytes of inner packet, and a QUIC handshake needs 1308. The node
+        // is fine -- the same one answers in under a second dialled directly --
+        // so reporting it as unreachable sends people looking for a fault that
+        // is not there.
+        for kind in ["Hysteria2", "hysteria", "Tuic"] {
+            let reason = unusable_behind_the_tunnel(kind).expect("QUIC cannot be carried");
+            assert!(reason.contains(kind), "the reason should name the protocol: {reason}");
+            assert!(reason.contains("Dial nodes through the tunnel"), "say what to do: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_reality_node_is_found_in_a_base64_subscription() {
+        // The shape the user's own panel serves: a base64 block of URIs, the
+        // name in the fragment, percent-encoded.
+        let body = "vless://id@host:443?security=reality&pbk=x&sid=y#WhiteAesther%20REALITY%20fallback\n\
+                    vless://id@host:8080?security=none&type=ws#VLESS-WS";
+        let mut found = HashSet::new();
+        collect_reality_names(body, &mut found);
+        assert!(found.contains("WhiteAesther REALITY fallback"), "{found:?}");
+        assert!(!found.contains("VLESS-WS"), "a plain node must not be labelled");
+    }
+
+    #[test]
+    fn a_reality_node_is_found_in_a_clash_provider() {
+        // The other shape: a Clash document, written as flow mappings, which is
+        // what a panel serving clash-meta returns.
+        let body = "proxies:\n                      - {name: TROJAN-REALITY-A, type: trojan, server: h, port: 8081,                     reality-opts: {public-key: k, short-id: s}}\n                      - {name: plain-trojan, type: trojan, server: h, port: 443}\n";
+        let mut found = HashSet::new();
+        collect_reality_names(body, &mut found);
+        assert!(found.contains("TROJAN-REALITY-A"), "{found:?}");
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn a_base64_subscription_is_decoded_and_a_plain_one_is_left_alone() {
+        let plain = "vless://id@host:443?security=reality#node";
+        // Encoded the way a panel serves it, with the line wrapping they add.
+        let encoded = "dmxlc3M6Ly9pZEBob3N0OjQ0Mz9zZWN1cml0eT1yZWFsaXR5I25vZGU=";
+        assert_eq!(decode_if_base64(encoded), plain);
+        // A file that is already readable must survive untouched, or a Clash
+        // document would be turned into rubbish.
+        assert_eq!(decode_if_base64(plain), plain);
+    }
+
+    #[test]
+    fn a_name_with_spaces_and_emoji_survives_the_round_trip() {
+        // Node names routinely carry both, and a mangled name matches nothing,
+        // which would leave the node silently unlabelled.
+        assert_eq!(percent_decode("%F0%9F%87%AF%F0%9F%87%B5%20tokyo"), "\u{1F1EF}\u{1F1F5} tokyo");
+        assert_eq!(percent_decode("plain-name"), "plain-name");
+        // A stray percent is not an escape and must not eat the next character.
+        assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn quic_is_only_a_problem_on_the_transport_that_cannot_carry_it() {
+        // WireGuard has 60 bytes of room the MASQUE path does not, which is the
+        // whole difference between a hysteria2 node that works behind the
+        // tunnel and one that never completes a handshake.
+        let reason = unusable_behind_the_tunnel("Hysteria2").expect("QUIC needs the bigger MTU");
+        assert!(reason.contains("WireGuard"), "say which way out there is: {reason}");
+    }
+
+    #[test]
+    fn everything_that_runs_over_tcp_is_left_alone() {
+        for kind in ["Vless", "Trojan", "Vmess", "Shadowsocks", "?"] {
+            assert!(unusable_behind_the_tunnel(kind).is_none(), "{kind} works behind the tunnel");
+        }
     }
 
     #[test]

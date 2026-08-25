@@ -233,6 +233,17 @@ export function Chain({ profile, onChange, connected, onToast }: ChainProps) {
   );
 }
 
+/**
+ * Two words for a reason that needs a sentence.
+ *
+ * The column is 132 pixels wide and the full reason is in the tooltip, so this
+ * only has to be enough to tell the two cases apart at a glance: a node this
+ * build cannot use at all, and one that only needs a different first hop.
+ */
+function unusableLabel(reason: string): string {
+  return reason.startsWith("REALITY") ? "not supported" : "needs WireGuard";
+}
+
 function Sources({
   sources,
   onChange,
@@ -340,7 +351,8 @@ function Nodes({
           <CardTitle className="text-[15px]">Nodes</CardTitle>
           <CardDescription>
             Every measurement here travels the tunnel, so a figure means the node works from behind
-            it — and a failure means it does not.
+            it — and a failure means it does not. A node marked in amber is not broken and was not
+            measured: hover it to read why this build cannot use it, and what to change.
           </CardDescription>
         </div>
         <Button variant="outline" size="sm" className="shrink-0" onClick={onRefresh}>
@@ -380,18 +392,25 @@ function Nodes({
                     </div>
                   </div>
                   <span
+                    title={node.unusable ?? undefined}
                     className={[
-                      "tabular w-[68px] shrink-0 text-right font-mono text-[12.5px]",
+                      "tabular shrink-0 text-right font-mono text-[12.5px]",
+                      node.unusable ? "w-[132px] text-amber-500/90" : "w-[68px]",
                       node.delay == null ? "text-muted-foreground" : "text-primary",
+                      node.unusable ? "text-amber-500/90" : "",
                     ].join(" ")}
                   >
-                    {node.delay == null ? "—" : `${node.delay} ms`}
+                    {node.unusable
+                      ? unusableLabel(node.unusable)
+                      : node.delay == null
+                        ? "—"
+                        : `${node.delay} ms`}
                   </span>
                   <Button
                     variant="ghost"
                     size="sm"
                     className="shrink-0"
-                    disabled={busy === node.name}
+                    disabled={busy === node.name || node.unusable != null}
                     onClick={() => onTest(node)}
                   >
                     Test
@@ -400,7 +419,8 @@ function Nodes({
                     variant={active ? "secondary" : "outline"}
                     size="sm"
                     className="w-[86px] shrink-0"
-                    disabled={busy === node.name}
+                    title={node.unusable ?? undefined}
+                    disabled={busy === node.name || node.unusable != null}
                     onClick={() => onSelect(node)}
                   >
                     {active ? "In use" : <><Zap />Use</>}
